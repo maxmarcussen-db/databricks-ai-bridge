@@ -29,6 +29,8 @@ def _query_genie_as_agent(
     from langchain_core.messages import AIMessage
 
     messages = input.get("messages", [])
+    # Get conversation_id from input state if it exists
+    conversation_id = input.get("conversation_id", None)
 
     # Apply message processor if provided
     if message_processor:
@@ -38,12 +40,13 @@ def _query_genie_as_agent(
         # Concatenate messages to form the chat history
         query += _concat_messages_array(messages)
 
-    # Send the message and wait for a response
-    genie_response = genie.ask_question(query)
+    # Send the message and wait for a response, passing conversation_id if available
+    genie_response = genie.ask_question(query, conversation_id=conversation_id)
 
     query_reasoning = genie_response.description or ""
     query_sql = genie_response.query or ""
     query_result = genie_response.result or ""
+    query_conversation_id = genie_response.conversation_id or ""
 
     # Create a list of AIMessage to return
     messages = []
@@ -53,7 +56,10 @@ def _query_genie_as_agent(
         messages.append(AIMessage(content=query_sql, name="query_sql"))
     messages.append(AIMessage(content=query_result, name="query_result"))
 
-    return {"messages": messages}
+    return {
+        "messages": messages,
+        "conversation_id": query_conversation_id
+    }
 
 
 @mlflow.trace(span_type="AGENT")
@@ -64,6 +70,8 @@ def GenieAgent(
     include_context: bool = False,
     message_processor: Optional[Callable] = None,
     client: Optional["WorkspaceClient"] = None,
+    truncate_results: bool = False,
+    return_pandas: bool = False
 ):
     """Create a genie agent that can be used to query the API. If a description is not provided, the description of the genie space will be used.
 
@@ -76,6 +84,9 @@ def GenieAgent(
                             or LangChain Message objects and return a query string. If not provided, the agent will
                             use the chat history to form the query.
         client: Optional WorkspaceClient instance
+        truncate_results: Whether to truncate results to fit within token limits
+        return_pandas: Whether to return results as pandas DataFrames (if False, returns markdown strings)
+
 
     Examples:
         # Basic usage
@@ -113,7 +124,12 @@ def GenieAgent(
 
     from langchain_core.runnables import RunnableLambda
 
-    genie = Genie(genie_space_id, client=client)
+    genie = Genie(
+        genie_space_id, 
+        client=client,
+        truncate_results=truncate_results,
+        return_pandas=return_pandas
+    )
 
     # Create a partial function with the genie_space_id pre-filled
     partial_genie_agent = partial(
