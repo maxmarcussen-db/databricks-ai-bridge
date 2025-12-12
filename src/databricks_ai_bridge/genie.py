@@ -357,3 +357,21 @@ class Genie:
         if not genie_response.conversation_id:
             genie_response.conversation_id = resp["conversation_id"]
         return genie_response
+
+    @mlflow.trace()
+    def send_feedback(self, conversation_id: str, message_id: str, is_positive: bool):
+        """Send thumbs up/down feedback to a Genie message.
+
+        Args:
+            conversation_id: The conversation ID containing the message.
+            message_id: The message ID to provide feedback for.
+            is_positive: True for positive (thumbs up), False for negative (thumbs down).
+        """
+        self.genie._api.do(
+            "POST",
+            f"/api/2.0/genie/spaces/{self.space_id}/conversations/{conversation_id}/messages/{message_id}/feedback",
+            body={
+                "rating": "POSITIVE" if is_positive else "NEGATIVE" if not is_positive else "NONE"
+            },
+            headers=self.headers,
+        )

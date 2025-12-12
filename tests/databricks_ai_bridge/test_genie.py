@@ -721,3 +721,23 @@ def test_poll_for_result_continues_on_mlflow_tracing_exceptions(genie, mock_work
 
         # should still complete successfully despite tracing failures
         assert result.result == "Success"
+
+
+def test_send_feedback_positive(genie, mock_workspace_client):
+    genie.send_feedback("conv_123", "msg_456", is_positive=True)
+    mock_workspace_client.genie._api.do.assert_called_once_with(
+        "POST",
+        "/api/2.0/genie/spaces/test_space_id/conversations/conv_123/messages/msg_456/feedback",
+        body={"rating": "POSITIVE"},
+        headers=genie.headers,
+    )
+
+
+def test_send_feedback_negative(genie, mock_workspace_client):
+    genie.send_feedback("conv_123", "msg_456", is_positive=False)
+    mock_workspace_client.genie._api.do.assert_called_once_with(
+        "POST",
+        "/api/2.0/genie/spaces/test_space_id/conversations/conv_123/messages/msg_456/feedback",
+        body={"rating": "NEGATIVE"},
+        headers=genie.headers,
+    )
