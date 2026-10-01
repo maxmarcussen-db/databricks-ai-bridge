@@ -11,6 +11,12 @@ import pytest
 from databricks_agentkit.runtime import model_services as ms
 
 SERVICE = "main.my_agent.llm"
+SYSTEM_SONNET = "/api/2.1/unity-catalog/model-services/system.ai.claude-sonnet-4-5"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_foundation_cache(monkeypatch):
+    monkeypatch.setattr(ms, "_foundation_cache", {})
 
 
 class _Api:
@@ -41,7 +47,8 @@ class _Client:
 
 
 def _service(model):
-    return {"config": {"routing": {"destinations": [ms.ppt_destination(model)]}}}
+    """A model service routed to ``model`` (a model-service name), as UC returns it."""
+    return {"config": {"routing": {"destinations": [ms.ppt_destination(ms.foundation_model(None, model))]}}}
 
 
 def test_names():
@@ -55,15 +62,31 @@ def test_names():
 
 
 def test_ppt_destination_shape():
-    assert ms.ppt_destination("claude-haiku-4-5") == {
+    assert ms.ppt_destination("system.ai.databricks-claude-haiku-4-5") == {
         "name": "primary",
         "destination_type": "DESTINATION_TYPE_PAY_PER_TOKEN_FOUNDATION_MODEL",
-        "pay_per_token_config": {"model": "models/system.ai.claude-haiku-4-5"},
+        "pay_per_token_config": {"model": "models/system.ai.databricks-claude-haiku-4-5"},
         "traffic_percentage": 100,
     }
 
 
-def test_destination_model_reads_first_destination():
+def test_foundation_model_reads_the_system_services_destination():
+    # Agents call system.ai.claude-sonnet-4-5; its destination is the registered model behind it.
+    routed = ms.ppt_destination("system.ai.databricks-claude-sonnet-4-5")
+    client = _Client({("GET", SYSTEM_SONNET): {"config": {"routing": {"destinations": [routed]}}}})
+    for name in ("claude-sonnet-4-5", "system.ai.claude-sonnet-4-5"):
+        assert ms.foundation_model(client, name) == "system.ai.databricks-claude-sonnet-4-5"
+    assert len(client.api_client.calls) == 1  # cached
+
+
+def test_foundation_model_falls_back_to_the_naming_convention():
+    assert ms.foundation_model(None, "gpt-5-4-mini") == "system.ai.databricks-gpt-5-4-mini"
+    assert ms.foundation_model(None, "system.ai.databricks-gpt-5-4-mini") == (
+        "system.ai.databricks-gpt-5-4-mini"
+    )
+
+
+def test_destination_model_maps_back_to_the_model_service_name():
     assert ms.destination_model(_service("claude-haiku-4-5")) == "system.ai.claude-haiku-4-5"
     assert ms.destination_model({"config": {}}) is None
 
@@ -72,13 +95,14 @@ def test_create_makes_schema_then_posts_under_parent():
     client = _Client()
     ms.create(client, SERVICE, "claude-sonnet-4-5", comment="managed_by=x")
     assert client.schemas.created == [("main", "my_agent")]
-    ((method, path, query, body),) = client.api_client.calls
+    (method, path, query, body) = client.api_client.calls[-1]
     assert (method, path) == ("POST", "/api/2.1/unity-catalog/model-services")
     assert query == {"parent": "schemas/main.my_agent", "model_service_id": "llm"}
-    assert body == {
-        "config": {"routing": {"destinations": [ms.ppt_destination("claude-sonnet-4-5")]}},
-        "comment": "managed_by=x",
+    destination = body["config"]["routing"]["destinations"][0]
+    assert destination["pay_per_token_config"] == {
+        "model": "models/system.ai.databricks-claude-sonnet-4-5"
     }
+    assert body["comment"] == "managed_by=x"
 
 
 @pytest.mark.parametrize(
@@ -87,14 +111,14 @@ def test_create_makes_schema_then_posts_under_parent():
 def test_create_tolerates_existing_schema(error):
     client = _Client(schema_error=error)
     ms.create(client, SERVICE, "claude-sonnet-4-5")
-    assert client.api_client.calls[0][0] == "POST"
+    assert client.api_client.calls[-1][0] == "POST"
 
 
 def test_create_surfaces_real_schema_errors():
     client = _Client(schema_error=PermissionError("no USE CATALOG on main"))
     with pytest.raises(PermissionError):
         ms.create(client, SERVICE, "claude-sonnet-4-5")
-    assert client.api_client.calls == []
+    assert not [c for c in client.api_client.calls if c[0] == "POST"]
 
 
 def test_get_set_delete():
@@ -106,7 +130,9 @@ def test_get_set_delete():
     method, set_path, query, body = client.api_client.calls[-1]
     assert (method, set_path) == ("PATCH", path)
     assert query == {"update_mask": "config.routing.destinations"}
-    assert body == {"config": {"routing": {"destinations": [ms.ppt_destination("claude-haiku-4-5")]}}}
+    assert body["config"]["routing"]["destinations"][0]["pay_per_token_config"] == {
+        "model": "models/system.ai.databricks-claude-haiku-4-5"
+    }
 
     ms.delete(client, SERVICE)
     assert client.api_client.calls[-1][:2] == ("DELETE", path)

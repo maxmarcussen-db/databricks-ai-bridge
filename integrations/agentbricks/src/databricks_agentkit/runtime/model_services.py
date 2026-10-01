@@ -96,11 +96,20 @@ def list_ai_gateway_model_services(client: WorkspaceClient) -> list[str]:
 # model directly, so the model behind it can be repointed without touching the agent. These helpers
 # are the one place the request shapes live; the CLI's API client and the model-upgrade optimizer
 # both build on them. Shapes follow the UC model-services API: a single pay-per-token destination
-# nested under ``config.routing.destinations``, with the model as ``models/system.ai.<model>``.
+# nested under ``config.routing.destinations``.
+#
+# Two names per model: agents call the *model service* ``system.ai.claude-sonnet-4-5``, but a
+# destination references the UC *registered model* behind it, ``models/system.ai.databricks-claude-
+# sonnet-4-5``. Callers here always use the model-service name; ``foundation_model`` resolves the
+# registered model (by reading the system service's own destination) and ``destination_model``
+# maps it back.
 
 _PERMISSIONS_PATH = "/api/2.1/unity-catalog/permissions"
 _PPT_DESTINATION = "DESTINATION_TYPE_PAY_PER_TOKEN_FOUNDATION_MODEL"
 _SYSTEM_AI_PREFIX = f"{_SYSTEM_AI_SCHEMA}."
+# Registered foundation models behind system.ai chat services carry this leaf prefix.
+_FOUNDATION_PREFIX = "databricks-"
+_foundation_cache: dict[str, str] = {}
 # Suffix of the temporary clone the model-upgrade optimizer evaluates candidates against. An
 # underscore, not a hyphen: the clone's name is a UC identifier.
 EXPERIMENT_SUFFIX = "_exp"
@@ -121,39 +130,68 @@ def service_path(name: str) -> str:
     return f"{_MODEL_SERVICES_PATH}/{name}"
 
 
-def ppt_destination(model: str) -> dict[str, Any]:
-    """A 100% pay-per-token destination for a ``system.ai.*`` foundation model."""
+def _service_leaf(model: str) -> str:
+    """``system.ai.databricks-claude-sonnet-4-5`` / ``claude-sonnet-4-5`` → ``claude-sonnet-4-5``."""
+    return model.removeprefix("models/").removeprefix(_SYSTEM_AI_PREFIX).removeprefix(_FOUNDATION_PREFIX)
+
+
+def foundation_model(client: WorkspaceClient | None, model: str) -> str:
+    """The registered foundation model (``system.ai.databricks-<model>``) behind a ``system.ai`` model.
+
+    Read from the ``system.ai.<model>`` service's own destination when a client is given (cached);
+    otherwise, or if that lookup fails, the ``databricks-`` naming every system.ai chat service
+    follows. Accepts either name form.
+    """
+    leaf = _service_leaf(model)
+    if leaf in _foundation_cache:
+        return _foundation_cache[leaf]
+    resolved = f"{_SYSTEM_AI_PREFIX}{_FOUNDATION_PREFIX}{leaf}"
+    if client is not None:
+        try:
+            raw = client.api_client.do("GET", service_path(f"{_SYSTEM_AI_PREFIX}{leaf}"))
+            destinations = (raw.get("config") or {}).get("routing", {}).get("destinations") or []
+            target = (destinations[0].get("pay_per_token_config") or {}).get("model") if destinations else None
+            if target:
+                resolved = target.removeprefix("models/")
+        except Exception:  # noqa: BLE001 - fall back to the naming convention
+            pass
+        _foundation_cache[leaf] = resolved
+    return resolved
+
+
+def ppt_destination(foundation: str) -> dict[str, Any]:
+    """A 100% pay-per-token destination for registered foundation model ``foundation``."""
     return {
         "name": "primary",
         "destination_type": _PPT_DESTINATION,
-        "pay_per_token_config": {"model": f"models/{system_ai_name(model)}"},
+        "pay_per_token_config": {"model": f"models/{foundation.removeprefix('models/')}"},
         "traffic_percentage": 100,
     }
 
 
 def destination_model(service: dict[str, Any]) -> str | None:
-    """The ``system.ai.*`` model a model service routes to (its first destination), or None."""
+    """The model a model service routes to, as the ``system.ai.*`` model-service name agents use."""
     destinations = (service.get("config") or {}).get("routing", {}).get("destinations") or []
     if not destinations:
         return None
     model = (destinations[0].get("pay_per_token_config") or {}).get("model") or ""
-    return model.removeprefix("models/") or None
+    return system_ai_name(_service_leaf(model)) if model else None
 
 
-def create_request(name: str, model: str, comment: str | None = None) -> tuple[dict, dict]:
-    """The ``(query, body)`` that creates model service ``name`` routed to ``model``."""
+def create_request(name: str, foundation: str, comment: str | None = None) -> tuple[dict, dict]:
+    """The ``(query, body)`` that creates model service ``name`` routed to registered ``foundation``."""
     catalog, schema, leaf = name.split(".")
-    body: dict[str, Any] = {"config": {"routing": {"destinations": [ppt_destination(model)]}}}
+    body: dict[str, Any] = {"config": {"routing": {"destinations": [ppt_destination(foundation)]}}}
     if comment:
         body["comment"] = comment
     return {"parent": f"schemas/{catalog}.{schema}", "model_service_id": leaf}, body
 
 
-def set_model_request(model: str) -> tuple[dict, dict]:
-    """The ``(query, body)`` that repoints a model service's destination to ``model``."""
+def set_model_request(foundation: str) -> tuple[dict, dict]:
+    """The ``(query, body)`` that repoints a model service to registered model ``foundation``."""
     return (
         {"update_mask": "config.routing.destinations"},
-        {"config": {"routing": {"destinations": [ppt_destination(model)]}}},
+        {"config": {"routing": {"destinations": [ppt_destination(foundation)]}}},
     )
 
 
@@ -202,13 +240,13 @@ def get_model(client: WorkspaceClient, name: str) -> str:
 def create(client: WorkspaceClient, name: str, model: str, comment: str | None = None) -> dict:
     """Create model service ``name`` routed to ``model``, creating its schema if missing."""
     ensure_schema(client, name)
-    query, body = create_request(name, model, comment)
+    query, body = create_request(name, foundation_model(client, model), comment)
     return client.api_client.do("POST", _MODEL_SERVICES_PATH, query=query, body=body)
 
 
 def set_model(client: WorkspaceClient, name: str, model: str) -> dict:
     """Repoint model service ``name`` to ``model``."""
-    query, body = set_model_request(model)
+    query, body = set_model_request(foundation_model(client, model))
     return client.api_client.do("PATCH", service_path(name), query=query, body=body)
 
 

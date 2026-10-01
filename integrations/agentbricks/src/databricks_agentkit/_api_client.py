@@ -277,12 +277,16 @@ class _AgentBricksApiClient:
             model_services.ensure_schema(self._w, name)
         except Exception as exc:  # noqa: BLE001 - normalized to AgentCliError
             raise wrap_api_error(exc) from exc
-        query, body = model_services.create_request(name, model, comment)
+        query, body = model_services.create_request(
+            name, model_services.foundation_model(self._w, model), comment
+        )
         return self._do("POST", _MODEL_SERVICES_PATH, query=query, body=body)
 
     def set_model_service_model(self, name: str, model: str) -> dict:
         """Repoint a model service's (single) destination to ``model`` (a ``system.ai.*`` name)."""
-        query, body = model_services.set_model_request(model)
+        query, body = model_services.set_model_request(
+            model_services.foundation_model(self._w, model)
+        )
         return self._do(
             "PATCH", model_services.service_path(name), query=query, body=body, safe_to_retry=True
         )
