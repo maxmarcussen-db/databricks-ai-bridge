@@ -163,6 +163,8 @@ def test_submit_upgrade_run_uploads_runner_and_installs_project(monkeypatch):
     assert (run_id, url) == (9, "https://ws/run/9")
     runner = "/Workspace/Users/me/p/.agentbricks/model_upgrade_job.py"
     assert "job_main" in client.uploaded[runner]
+    # Set before any import: psycopg's bundled OpenSSL aborts on FIPS compute.
+    assert client.uploaded[runner].index("PSYCOPG_IMPL") < client.uploaded[runner].index("import job_main")
     assert client.submitted["python_file"] == runner
     assert client.submitted["parameters"] == ["/Workspace/Users/me/p", config.to_param()]
     assert client.submitted["dependencies"] == [
