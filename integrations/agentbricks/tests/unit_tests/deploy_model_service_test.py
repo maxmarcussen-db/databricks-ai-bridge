@@ -9,7 +9,6 @@ import pytest
 from databricks_agentbricks.agent_project import AgentProject
 from databricks_agentbricks.cli import deploy as deploy_mod
 from databricks_agentbricks.errors import AgentCliError
-from databricks_agentkit._api_client import _ppt_destination, model_service_destination
 
 SERVICE = "main.my_agent.llm"
 
@@ -57,8 +56,3 @@ def test_missing_service_without_default_explains_how_to_fix(tmp_path):
         deploy_mod._reconcile_model_service(_project(tmp_path, default=None), _FakeClient(False))
     assert "--default" in (exc_info.value.hint or "")
 
-
-def test_destination_shape_round_trips():
-    service = {"config": {"routing": {"destinations": [_ppt_destination("claude-haiku-4-5")]}}}
-    assert model_service_destination(service) == "system.ai.claude-haiku-4-5"
-    assert model_service_destination({"config": {}}) is None

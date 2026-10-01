@@ -21,7 +21,7 @@ import click
 
 from databricks_agentbricks import render
 from databricks_agentbricks.errors import AgentCliError
-from databricks_agentkit._api_client import model_service_destination
+from databricks_agentkit.runtime.model_services import destination_model
 
 _BIND_COMMAND = "agentbricks models bind <catalog>.<schema>.<name> --default system.ai.<model>"
 
@@ -65,7 +65,7 @@ def _current_model(client, service: str) -> str:
                 hint="Run `agentbricks deploy` to create it from agent.toml.",
             ) from exc
         raise
-    model = model_service_destination(resolved)
+    model = destination_model(resolved)
     if model is None:
         raise AgentCliError(f"Model service '{service}' has no foundation-model destination.")
     return model

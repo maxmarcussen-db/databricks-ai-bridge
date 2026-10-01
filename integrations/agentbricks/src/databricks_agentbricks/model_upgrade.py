@@ -2,12 +2,13 @@
 
 Replays the agent's recent production requests (root ``invoke`` spans from its bound trace
 experiment) through the project's own agent code, once per candidate model, and scores each answer
-against what production returned with an LLM judge. The search itself is Smart Model Upgrades'
-``optimize_prompts_and_models`` (GEPA), which routes the agent's calls to a temporary ``<service>_exp``
-clone of the bound model service, so production traffic is never touched while candidates run.
+against what production returned with an LLM judge. The search itself is
+``databricks_agentkit.model_upgrades.optimize_prompts_and_models`` (GEPA), which routes the agent's
+calls to a temporary ``<service>_exp`` clone of the bound model service, so production traffic is
+never touched while candidates run.
 
-Heavy dependencies (``smart_model_upgrades``, ``gepa``, full ``mlflow``) are imported lazily and only
-here, behind the ``upgrade`` extra, so the rest of the CLI stays light.
+Its heavy dependencies (``gepa``, full ``mlflow``) are imported lazily and only here, behind the
+``upgrade`` extra, so the rest of the CLI stays light.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from typing import Any, Optional
 
 from databricks_agentbricks.errors import AgentCliError
 from databricks_agentbricks.project_types import AgentFramework
+from databricks_agentkit.runtime.model_services import system_ai_name
 from databricks_agentkit.runtime.tool_manifest import MODEL_SERVICE_ENV
 
 UPGRADE_EXTRA_HINT = "Install it with: pip install 'databricks-agentbricks[upgrade]'"
@@ -86,11 +88,6 @@ class UpgradeReport:
 
 
 # --- model names ----------------------------------------------------------------
-
-
-def system_ai_name(model: str) -> str:
-    """``claude-sonnet-4-5`` / ``system.ai.claude-sonnet-4-5`` → ``system.ai.claude-sonnet-4-5``."""
-    return model if model.startswith(_SYSTEM_AI) else f"{_SYSTEM_AI}{model}"
 
 
 def bare_name(model: str) -> str:
@@ -239,6 +236,7 @@ def make_predict_fn(
             "`uv run --with 'databricks-agentbricks[upgrade]' agentbricks models upgrade`.",
         ) from exc
     run_agent = agent_module.run_agent
+    _enable_autolog(framework)
 
     if framework == AgentFramework.LANGGRAPH:
 
@@ -261,6 +259,21 @@ def make_predict_fn(
         return final_text(asyncio.run(_run(inputs["agent_input"])))
 
     return predict
+
+
+def _enable_autolog(framework: AgentFramework) -> None:
+    """Turn on the framework's MLflow autolog so the optimizer prices candidates on real tokens.
+
+    The templates only enable it in ``configure()`` at server startup, which the replay skips; without
+    it every call is priced at a flat 500/200-token estimate and the cost component can't tell a
+    terse model from a verbose one.
+    """
+    import mlflow  # noqa: PLC0415 - heavy optional dependency
+
+    if framework == AgentFramework.LANGGRAPH:
+        mlflow.langchain.autolog()
+    else:
+        mlflow.openai.autolog()
 
 
 # --- scoring --------------------------------------------------------------------
@@ -293,16 +306,14 @@ def make_equivalence_scorer(judge_model: str = DEFAULT_JUDGE_MODEL) -> Callable[
 # --- the search -----------------------------------------------------------------
 
 
-def _smu():
+def _optimizer():
     try:
-        import smart_model_upgrades as smu  # noqa: PLC0415 - heavy optional dependency
-        from smart_model_upgrades import ai_gateway  # noqa: PLC0415
+        from databricks_agentkit import model_upgrades  # noqa: PLC0415 - needs gepa + full mlflow
     except ImportError as exc:
         raise AgentCliError(
             "`agentbricks models upgrade` requires the 'upgrade' extra.", hint=UPGRADE_EXTRA_HINT
         ) from exc
-    ai_gateway.set_backend("model_services")
-    return smu
+    return model_upgrades
 
 
 def _model_scores(result: Any, service: str) -> dict[str, float]:
@@ -338,7 +349,7 @@ def run_upgrade(
     if profile:
         # The optimizer and the agent build their own WorkspaceClients; point them at this profile.
         os.environ["DATABRICKS_CONFIG_PROFILE"] = profile
-    smu = _smu()
+    optimizer = _optimizer()
     train, val = split_records(records_from_traces(traces))
     predict = make_predict_fn(root, framework, service)
     scorer = make_equivalence_scorer(judge_model)
@@ -349,7 +360,7 @@ def run_upgrade(
         # experiment, or the next upgrade would train on its own eval traffic.
         mlflow.set_experiment(f"{experiment_name}-model-upgrades")
     weight_quality, weight_latency, weight_cost = weights
-    result = smu.optimize_prompts_and_models(
+    result = optimizer.optimize_prompts_and_models(
         predict,
         train,
         val,
@@ -359,6 +370,7 @@ def run_upgrade(
         weight_quality=weight_quality,
         weight_latency=weight_latency,
         weight_cost=weight_cost,
+        model_selection="bandit",
         display_progress_bar=False,
     )
     winner = result.best_candidate.get(f"model:{service}") or bare_name(current_model)

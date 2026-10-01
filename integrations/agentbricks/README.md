@@ -425,6 +425,47 @@ agentbricks deploy my-agent
 
 Memory and session stores are independent resources: deleting one never affects the other.
 
+## Model upgrades
+
+Point the agent at a Unity Catalog AI Gateway model service you own, and the model behind it can
+change without a code change or redeploy:
+
+```sh
+agentbricks models bind main.my_agent.llm --default system.ai.claude-sonnet-4-5
+agentbricks deploy my-agent      # creates the service and grants the app EXECUTE on it
+agentbricks models upgrade -c system.ai.claude-haiku-4-5 -c system.ai.gpt-5-4-mini
+```
+
+`models upgrade` replays the deployed agent's recent traces through your agent code once per
+candidate, against a temporary `<service>_exp` clone, scores each answer against production's with
+an LLM judge, and switches to the best quality / latency / cost trade-off when you confirm.
+`models rollback` undoes the last switch.
+
+The search is `databricks_agentkit.model_upgrades`, which you can also call directly (for example
+from a notebook) to tune several model services and MLflow Prompt Registry prompts together:
+
+```python
+from databricks_agentkit.model_upgrades import optimize_prompts_and_models, promote_to_prod
+
+result = optimize_prompts_and_models(
+    predict,  # predict(inputs: dict) -> answer
+    train_data,  # [{"inputs": {...}, "expectations": {"expected_response": ...}}, ...]
+    val_data,
+    prompt_uris=["prompts:/main.my_agent.router@production"],
+    gateway_endpoints={
+        "main.my_agent.router_llm": ["claude-haiku-4-5", "gpt-5-4-mini"],
+        "main.my_agent.writer_llm": ["claude-sonnet-4-5", "claude-haiku-4-5"],
+    },
+    scorers=scorers,  # MLflow scorers, or (inputs, expectations, answer) -> float
+    max_metric_calls=200,
+)
+promote_to_prod(result)  # repoints the services, registers and aliases the winning prompts
+```
+
+Model choices use a UCB1 bandit by default (`model_selection="reflection"` asks the reflection LLM
+instead); prompts are rewritten by GEPA's reflection loop. Both need the `upgrade` extra:
+`pip install 'databricks-agentbricks[upgrade]'`.
+
 ## Commands
 
 For the full command reference - every command, subcommand, argument, and option, in table form -
