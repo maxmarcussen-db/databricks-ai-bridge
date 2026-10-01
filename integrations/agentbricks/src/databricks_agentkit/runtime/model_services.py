@@ -214,6 +214,30 @@ def grant_requests(name: str, principal: str) -> list[tuple[str, dict, bool]]:
     ]
 
 
+def can_execute(client: WorkspaceClient, model: str, principal: str) -> bool | None:
+    """Whether ``principal`` holds EXECUTE on the registered model behind ``model``.
+
+    A model service can only route to a model its owner can execute; UC rejects the repoint
+    otherwise ("owner lacks EXECUTE on ... destination model(s)"), and workspaces often grant
+    system.ai models individually. None when the grants can't be read (unknown, not denied).
+    """
+    foundation = foundation_model(client, model)
+    try:
+        raw = client.api_client.do(
+            "GET",
+            f"/api/2.1/unity-catalog/effective-permissions/function/{foundation}",
+            query={"principal": principal},
+        )
+    except Exception:  # noqa: BLE001 - unreadable grants aren't a denial
+        return None
+    privileges = {
+        p.get("privilege")
+        for assignment in (raw or {}).get("privilege_assignments") or []
+        for p in assignment.get("privileges") or []
+    }
+    return "EXECUTE" in privileges or "ALL_PRIVILEGES" in privileges
+
+
 def ensure_schema(client: WorkspaceClient, name: str) -> None:
     """Create the parent ``catalog.schema`` of model service ``name`` if it's missing.
 

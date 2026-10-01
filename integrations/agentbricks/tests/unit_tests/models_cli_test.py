@@ -233,9 +233,12 @@ def _report(recommended: str) -> model_upgrade.UpgradeReport:
 class _JobClient(_FakeClient):
     current_user = "me@example.com"
 
-    def __init__(self, life_cycle="RUNNING", result=None):
+    def __init__(self, life_cycle="RUNNING", result=None, denied=()):
         super().__init__()
-        self.life_cycle, self.result = life_cycle, result
+        self.life_cycle, self.result, self.denied = life_cycle, result, set(denied)
+
+    def can_execute_model(self, model):
+        return model not in self.denied
 
     def get_run(self, run_id):
         state = SimpleNamespace(life_cycle_state=self.life_cycle, result_state=self.result)
@@ -328,6 +331,17 @@ def test_apply_with_no_runs_errors(tmp_path):
     result = _invoke(["apply", "--yes", "--source", str(project)], _Ctx(_JobClient()))
     assert result.exit_code != 0
     assert "No upgrade run" in result.output
+
+
+def test_upgrade_refuses_candidates_the_owner_cannot_execute(tmp_path, stub_job):
+    project = _project(tmp_path)
+    client = _JobClient(denied={"system.ai.gpt-5-4-mini"})
+    result = _invoke(
+        ["upgrade", "-c", "claude-haiku-4-5,gpt-5-4-mini", "--source", str(project)], _Ctx(client)
+    )
+    assert result.exit_code != 0
+    assert "gpt-5-4-mini" in result.output
+    assert "submit" not in stub_job and stub_job["synced"] == []
 
 
 def test_upgrade_requires_tracing(tmp_path, stub_job):

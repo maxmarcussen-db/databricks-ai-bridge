@@ -454,6 +454,16 @@ def models_upgrade(
     ]
     client = obj.client()
     current = _current_model(client, service)  # fails fast if the service isn't deployed yet
+    # A model service can only route to models its owner can execute; catch that now rather than
+    # an hour into the job.
+    denied = [name for name in names if client.can_execute_model(name) is False]
+    if denied:
+        raise AgentCliError(
+            f"You can't route the model service to: {', '.join(denied)}.",
+            hint="A model service can only route to models its owner holds EXECUTE on. Ask a "
+            "workspace admin to grant EXECUTE on those system.ai models, or pick others "
+            "(`agentbricks models list`).",
+        )
     config = model_upgrade.JobConfig(
         upgrade_id=uuid.uuid4().hex[:12],
         service=service,

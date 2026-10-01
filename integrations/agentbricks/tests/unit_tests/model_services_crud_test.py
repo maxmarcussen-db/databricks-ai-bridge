@@ -153,3 +153,23 @@ def test_grant_requests_execute_required_parents_best_effort():
         ("/api/2.1/unity-catalog/permissions/model_service/main.my_agent.llm", True),
     ]
     assert requests[-1][1] == {"changes": [{"principal": "sp-app-id", "add": ["EXECUTE"]}]}
+
+
+def test_can_execute_reads_effective_permissions():
+    perms = "/api/2.1/unity-catalog/effective-permissions/function/system.ai.databricks-gpt-5"
+    granted = {"privilege_assignments": [{"privileges": [{"privilege": "EXECUTE"}]}]}
+    manage_only = {"privilege_assignments": [{"privileges": [{"privilege": "MANAGE"}]}]}
+    assert ms.can_execute(_Client({("GET", perms): granted}), "gpt-5", "me") is True
+    assert ms.can_execute(_Client({("GET", perms): manage_only}), "gpt-5", "me") is False
+
+
+def test_can_execute_is_unknown_when_grants_are_unreadable():
+    class _Denied(_Api):
+        def do(self, method, path, query=None, body=None):
+            if "effective-permissions" in path:
+                raise PermissionError("no")
+            return super().do(method, path, query, body)
+
+    client = _Client()
+    client.api_client = _Denied()
+    assert ms.can_execute(client, "gpt-5", "me") is None

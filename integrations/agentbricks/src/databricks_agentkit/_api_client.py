@@ -303,6 +303,10 @@ class _AgentBricksApiClient:
                 if required:
                     raise
 
+    def can_execute_model(self, model: str) -> Optional[bool]:
+        """Whether the caller can execute ``model``'s registered model (None if unknown)."""
+        return model_services.can_execute(self._w, model, self.current_user)
+
     def list_chat_model_services(self) -> list[str]:
         """The chat-capable ``system.ai.*`` model services in this workspace, sorted."""
         return model_services.list_ai_gateway_model_services(self._w)
