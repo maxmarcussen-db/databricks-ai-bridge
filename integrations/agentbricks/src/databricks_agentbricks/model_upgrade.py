@@ -25,6 +25,7 @@ import os
 import pathlib
 import re
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
@@ -251,6 +252,24 @@ def load_traces(profile: Optional[str], experiment_name: str, limit: int) -> lis
 
 # --- replaying the agent --------------------------------------------------------
 
+_replay_loop: Optional[asyncio.AbstractEventLoop] = None
+_replay_loop_lock = threading.Lock()
+
+
+def run_sync(coro: Any) -> Any:
+    """Run ``coro`` to completion from sync code, on one dedicated background event loop.
+
+    ``asyncio.run`` fails where a loop is already running, and Databricks serverless Python tasks
+    run inside an IPython kernel that has one. A single long-lived loop also keeps any async clients
+    the agent caches bound to one loop, and is safe to call from the optimizer's worker threads.
+    """
+    global _replay_loop
+    with _replay_loop_lock:
+        if _replay_loop is None:
+            _replay_loop = asyncio.new_event_loop()
+            threading.Thread(target=_replay_loop.run_forever, daemon=True).start()
+    return asyncio.run_coroutine_threadsafe(coro, _replay_loop).result()
+
 
 def make_predict_fn(
     root: pathlib.Path, framework: AgentFramework, service: str
@@ -296,7 +315,7 @@ def make_predict_fn(
             return result.final_output
 
     def predict(inputs: dict) -> str:
-        return final_text(asyncio.run(_run(inputs["agent_input"])))
+        return final_text(run_sync(_run(inputs["agent_input"])))
 
     return predict
 

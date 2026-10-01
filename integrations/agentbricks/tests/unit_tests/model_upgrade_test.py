@@ -172,3 +172,18 @@ def test_submit_upgrade_run_uploads_runner_and_installs_project(monkeypatch):
         "databricks-agentbricks[upgrade]==9.9",
     ]
     assert client.submitted["environment_version"] == model_upgrade.SERVERLESS_ENVIRONMENT_VERSION
+
+
+def test_run_sync_works_inside_a_running_event_loop():
+    # Databricks serverless Python tasks run inside a kernel with a running loop, where asyncio.run
+    # raises; replays must still work there.
+    import asyncio
+
+    async def answer():
+        return 42
+
+    async def from_inside_a_loop():
+        return model_upgrade.run_sync(answer())
+
+    assert model_upgrade.run_sync(answer()) == 42
+    assert asyncio.run(from_inside_a_loop()) == 42
