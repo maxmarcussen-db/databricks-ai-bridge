@@ -844,9 +844,16 @@ def _estimate_cost_usd(candidate, endpoint_targets, total_tokens, token_costs,
         return 0.0
 
     if llm_calls:
+        # A call to a model service (or its `_exp` clone) records the service's name, which no
+        # catalog can price; price it as the model the candidate routes that service to.
+        routed = {}
+        for et in endpoint_targets:
+            chosen = candidate.get(_model_key(et), et.initial_model)
+            routed[et.name] = routed[et.exp_name] = chosen
         total = 0.0
         for call in llm_calls:
             model = call.get("model")
+            model = routed.get(model, model)
             in_t = call.get("input") or 0
             out_t = call.get("output") or 0
             rate = token_costs.get(model) if model else None

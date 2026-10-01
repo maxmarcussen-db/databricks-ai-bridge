@@ -63,3 +63,21 @@ def test_cleanup_deletes_clone_and_hints_on_failure(mocker, capsys):
 def test_system_ai_names_pass_through_resolution():
     # Agent Bricks agents name models as system.ai.*; resolution must not double the prefix.
     assert opt._resolve_system_ai_name("system.ai.claude-haiku-4-5") == "system.ai.claude-haiku-4-5"
+
+
+def test_cost_prices_calls_to_the_service_as_the_routed_candidate(mocker):
+    # Autolog records the requested name -- the model service's `_exp` clone -- not a model.
+    priced = []
+
+    def _cost(model, in_t, out_t):
+        priced.append(model)
+        return 0.001
+
+    mocker.patch("databricks_agentkit.model_upgrades.optimization._mlflow_model_cost", side_effect=_cost)
+    et = _target()
+    calls = [{"model": "main.agent.llm_exp", "input": 100, "output": 50}]
+    cost = opt._estimate_cost_usd(
+        {"model:main.agent.llm": "claude-haiku-4-5"}, [et], {}, {}, llm_calls=calls
+    )
+    assert cost == 0.001
+    assert priced == ["claude-haiku-4-5"]
