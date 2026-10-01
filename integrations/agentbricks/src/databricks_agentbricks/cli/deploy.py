@@ -63,7 +63,11 @@ from databricks_agentkit.runtime.store import (
     RUNTIME_STORE_SCHEMA_ENV,
     RUNTIME_STORE_USERNAME_ENV,
 )
-from databricks_agentkit.runtime.tool_manifest import MEMORY_STORE_ENV, SESSION_STORE_ENV
+from databricks_agentkit.runtime.tool_manifest import (
+    MEMORY_STORE_ENV,
+    MODEL_SERVICE_ENV,
+    SESSION_STORE_ENV,
+)
 
 # TEMPORARY: the Apps build environment currently can't reach the internal pypi proxy, so builds
 # time out installing dependencies. Point the build at public PyPI (sanctioned interim workaround)
@@ -387,6 +391,44 @@ def _reconcile_declared_stores(
     return memory_store_id
 
 
+# Error codes UC returns for a model service that doesn't exist yet.
+_NOT_FOUND_CODES = {"NOT_FOUND", "RESOURCE_DOES_NOT_EXIST"}
+
+
+def _reconcile_model_service(project, client) -> Optional[str]:
+    """Create the model service DECLARED in agent.toml if it doesn't exist yet; return its name.
+
+    A new service routes to the binding's ``default`` model. An existing one is left alone: its
+    destination belongs to `agentbricks models upgrade` / `set` after the first deploy, so a redeploy must
+    never reset an upgrade. Returns None when no model service is bound.
+    """
+    if project is None or not project.model_service:
+        return None
+    name = str(project.model_service)
+    with render.status(f"Reconciling model service '{name}'…"):
+        try:
+            client.get_model_service(name)
+            return name
+        except AgentCliError as exc:
+            if exc.error_code not in _NOT_FOUND_CODES:
+                raise
+        if not project.model_service_default:
+            raise AgentCliError(
+                f"Model service '{name}' doesn't exist and agent.toml declares no default model.",
+                hint=f"Run `agentbricks models bind {name} --default system.ai.<model>` so deploy can "
+                "create it.",
+            )
+        client.create_model_service(
+            name,
+            str(project.model_service_default),
+            comment="Managed by agentbricks; repoint with `agentbricks models`.",
+        )
+    render.console().print(
+        f"[green]✓[/] Created model service {name!r} → {project.model_service_default}"
+    )
+    return name
+
+
 def get_or_create_trace_experiment(
     source: pathlib.Path, client, profile
 ) -> Optional[ResolvedTraceExperiment]:
@@ -594,6 +636,7 @@ def deploy(
     #    is the only reconcile-to-cloud verb; agent.toml is the source of truth and is never rewritten.
     memory_store, session_store, _ = resource_bindings(source_dir)
     memory_store_id = _reconcile_declared_stores(memory_store, session_store, client)
+    model_service = _reconcile_model_service(project, client)
 
     # 2. Provision tracing when bound (`agentbricks init` binds a default experiment): get-or-create the
     #    experiment NAME from agent.toml and wire the two env vars the runtime reads. Resolved by name,
@@ -633,6 +676,9 @@ def deploy(
         env_updates[MEMORY_STORE_ENV] = memory_store_id
     if session_store:
         env_updates[SESSION_STORE_ENV] = session_store
+    if model_service:
+        env_updates[MODEL_SERVICE_ENV] = model_service
+        provisioned["Model service"] = model_service
 
     legacy_runtime_backend = None
     if (
@@ -762,6 +808,19 @@ def deploy(
     # flaky deploy must not silently revoke the SP's trace access the way an unbind does. (Whether
     # removing a `uc_securable` resource also revokes the underlying UC MODIFY grant is platform
     # behavior - documented but not yet verified live.)
+    # The bound model service is a UC securable the app's SP must hold EXECUTE on to call it
+    # (system.ai.* models are granted broadly; a user-owned service is not).
+    model_grant_error: Optional[str] = None
+    if model_service:
+        with render.status("Granting the app access to its model service…"):
+            sp = _app_service_principal(name, obj.profile)
+            if sp is None:
+                model_grant_error = "could not resolve the app's service principal."
+            else:
+                try:
+                    client.grant_model_service_execute(model_service, sp)
+                except AgentCliError as exc:
+                    model_grant_error = exc.hint or str(exc)
     trace_grant_error: Optional[str] = None
     if trace_setup_error is None:
         with render.status("Granting the agent runtime access to its trace experiment…"):
@@ -789,6 +848,11 @@ def deploy(
                 if not grants_stores
                 else ("granted" if grant_error is None else "failed"),
                 "store_grant_error": grant_error,
+                "model_service": model_service,
+                "model_service_grant": None
+                if not model_service
+                else ("granted" if model_grant_error is None else "failed"),
+                "model_service_grant_error": model_grant_error,
             }
         )
         return
@@ -827,6 +891,15 @@ def deploy(
             "The app's service principal needs write access to its trace experiment; that grant "
             f"couldn't be applied automatically. Cause: {trace_grant_error}",
         )
+    if model_service and model_grant_error is not None:
+        steps.insert(
+            0,
+            f"The app's service principal needs EXECUTE on model service '{model_service}' (plus "
+            "USE CATALOG / USE SCHEMA); that grant couldn't be applied automatically. "
+            f"Cause: {model_grant_error}",
+        )
+    if model_service and model_grant_error is None:
+        provisioned["Model access"] = "granted to app service principal"
     if grants_stores and grant_error is None:
         provisioned["Store access"] = "granted to app service principal"
     if trace_experiment_id and trace_grant_error is None:

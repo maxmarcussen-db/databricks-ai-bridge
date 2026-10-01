@@ -18,6 +18,9 @@ except ModuleNotFoundError:
 # names live in `agent_project`, next to the manifest parsing that reads them.)
 MEMORY_STORE_ENV = "AGENT_MEMORY_STORE"
 SESSION_STORE_ENV = "AGENT_SESSION_STORE"
+# The UC model service (catalog.schema.name) the agent calls through the AI Gateway, written by
+# `agentbricks deploy` from agent.toml's [model_service] binding.
+MODEL_SERVICE_ENV = "AGENT_MODEL_SERVICE"
 
 
 class ToolManifestError(RuntimeError):
@@ -214,6 +217,16 @@ def resolve_session_store(explicit: str | None = None) -> str | None:
     None means "no session store" (in-memory).
     """
     return explicit or os.getenv(SESSION_STORE_ENV) or None
+
+
+def resolve_model_service(explicit: str | None = None) -> str | None:
+    """The model service name: ``explicit`` arg → ``AGENT_MODEL_SERVICE`` env → None.
+
+    None means "no bound model service": the agent falls back to its own default model. A bound
+    service is a user-owned UC model service whose destination `agentbricks models` can repoint,
+    so upgrading the model needs no code change or redeploy.
+    """
+    return explicit or os.getenv(MODEL_SERVICE_ENV) or None
 
 
 def downscope_wire(tool: ToolRecord) -> dict[str, list[dict[str, str]]]:

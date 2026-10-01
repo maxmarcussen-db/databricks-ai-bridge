@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 
 _BASE = "/api/2.0/agents"
 _MCP_SERVICES_PATH = "/api/2.1/unity-catalog/mcp-services"
+_MODEL_SERVICES_PATH = "/api/2.1/unity-catalog/model-services"
+_UC_PERMISSIONS_PATH = "/api/2.1/unity-catalog/permissions"
 
 # Transient backend failures (e.g. a CANCELLED RPC) usually clear on a retry, so retry safe
 # requests once before surfacing them. Mutating requests must opt in explicitly: their first
@@ -145,6 +147,27 @@ def _workspace_client(profile: Optional[str]) -> WorkspaceClient:
     )
 
 
+def model_service_destination(service: dict) -> Optional[str]:
+    """The ``system.ai.*`` model a model service routes to (its first destination), or None."""
+    destinations = (service.get("config") or {}).get("routing", {}).get("destinations") or []
+    if not destinations:
+        return None
+    model = (destinations[0].get("pay_per_token_config") or {}).get("model") or ""
+    return model.removeprefix("models/") or None
+
+
+def _ppt_destination(model: str) -> dict:
+    """A 100% pay-per-token destination for a ``system.ai.*`` foundation model."""
+    if not model.startswith("system.ai."):
+        model = f"system.ai.{model}"
+    return {
+        "name": "primary",
+        "destination_type": "DESTINATION_TYPE_PAY_PER_TOKEN_FOUNDATION_MODEL",
+        "pay_per_token_config": {"model": f"models/{model}"},
+        "traffic_percentage": 100,
+    }
+
+
 class _AgentBricksApiClient:
     """Private transport for the 2.0 agents API until the generated SDK is available."""
 
@@ -262,6 +285,83 @@ class _AgentBricksApiClient:
             _MCP_SERVICES_PATH,
             query=_query(parent=f"schemas/{schema}", page_token=page_token),
         )
+
+    # --- Unity Catalog AI Gateway model services -----------------------------
+
+    def get_model_service(self, name: str) -> dict:
+        """Look up a model service by its three-part name (``catalog.schema.name``)."""
+        return self._do("GET", f"{_MODEL_SERVICES_PATH}/{quote(name, safe='.')}")
+
+    def create_model_service(self, name: str, model: str, *, comment: str | None = None) -> dict:
+        """Create a model service routing 100% of traffic to ``model`` (a ``system.ai.*`` name).
+
+        The parent ``catalog.schema`` is created first if missing: UC 404s a model-service create
+        under a nonexistent schema with a bare "Resource not found".
+        """
+        catalog, schema, leaf = name.split(".")
+        self._ensure_schema(catalog, schema)
+        body: dict[str, Any] = {"config": {"routing": {"destinations": [_ppt_destination(model)]}}}
+        if comment:
+            body["comment"] = comment
+        return self._do(
+            "POST",
+            _MODEL_SERVICES_PATH,
+            query={"parent": f"schemas/{catalog}.{schema}", "model_service_id": leaf},
+            body=body,
+        )
+
+    def set_model_service_model(self, name: str, model: str) -> dict:
+        """Repoint a model service's (single) destination to ``model`` (a ``system.ai.*`` name)."""
+        return self._do(
+            "PATCH",
+            f"{_MODEL_SERVICES_PATH}/{quote(name, safe='.')}",
+            query={"update_mask": "config.routing.destinations"},
+            body={"config": {"routing": {"destinations": [_ppt_destination(model)]}}},
+            safe_to_retry=True,
+        )
+
+    def grant_model_service_execute(self, name: str, principal: str) -> dict:
+        """Grant ``principal`` EXECUTE on a model service, plus USE SCHEMA / USE CATALOG on its parents.
+
+        EXECUTE is required and its failure raises. The parent grants are best-effort: the principal
+        often already holds them (e.g. via ``account users``), and granting on a catalog the caller
+        doesn't manage would otherwise fail a deploy that works.
+        """
+        catalog, schema, _ = name.split(".")
+        for securable, full_name, privilege in (
+            ("catalog", catalog, "USE_CATALOG"),
+            ("schema", f"{catalog}.{schema}", "USE_SCHEMA"),
+        ):
+            try:
+                self._do(
+                    "PATCH",
+                    f"{_UC_PERMISSIONS_PATH}/{securable}/{quote(full_name, safe='.')}",
+                    body={"changes": [{"principal": principal, "add": [privilege]}]},
+                    safe_to_retry=True,
+                )
+            except AgentCliError:
+                pass
+        return self._do(
+            "PATCH",
+            f"{_UC_PERMISSIONS_PATH}/model_service/{quote(name, safe='.')}",
+            body={"changes": [{"principal": principal, "add": ["EXECUTE"]}]},
+            safe_to_retry=True,
+        )
+
+    def list_chat_model_services(self) -> list[str]:
+        """The chat-capable ``system.ai.*`` model services in this workspace, sorted."""
+        from databricks_agentkit.runtime.model_services import list_ai_gateway_model_services
+
+        return list_ai_gateway_model_services(self._w)
+
+    def _ensure_schema(self, catalog: str, schema: str) -> None:
+        try:
+            self._w.schemas.create(name=schema, catalog_name=catalog)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it's the duplicate case
+            # UC reports a duplicate schema inconsistently: sometimes the typed AlreadyExists,
+            # sometimes a 400 BadRequest whose message says "already exists". Tolerate both.
+            if "already exists" not in str(exc).lower():
+                raise wrap_api_error(exc) from exc
 
     # --- memory stores -------------------------------------------------------
 

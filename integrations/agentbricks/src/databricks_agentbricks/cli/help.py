@@ -19,6 +19,7 @@ _COMMAND_SECTIONS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("SETUP", ("login", "logout", "init", "doctor")),
     ("DEVELOP", ("dev", "tools", "memory", "sessions", "tracing")),
     ("SHIP", ("deploy", "deployments")),
+    ("IMPROVE", ("models",)),
 )
 
 # Each example is either a bare command, or a (command, comment) pair. The comment is a short gloss
@@ -282,6 +283,32 @@ _EXAMPLES: dict[CommandPath, tuple[Example, ...]] = {
         ("agentbricks tracing bind --experiment-id 12345", "or by experiment id"),
     ),
     ("tracing", "unbind"): (("agentbricks tracing unbind", "turn tracing off"),),
+    ("models",): (
+        (
+            "agentbricks models bind main.my_agent.llm --default system.ai.claude-sonnet-4-5",
+            "call a model service you own (deploy creates it)",
+        ),
+        (
+            "agentbricks models upgrade -c system.ai.claude-haiku-4-5 -c system.ai.gpt-5-4-mini",
+            "evaluate cheaper models on the agent's traces and switch to the best",
+        ),
+        ("agentbricks models rollback", "undo the last switch"),
+    ),
+    ("models", "bind"): (
+        (
+            "agentbricks models bind main.my_agent.llm --default system.ai.claude-sonnet-4-5",
+            "declare the agent's model service in agent.toml",
+        ),
+    ),
+    ("models", "upgrade"): (
+        (
+            "agentbricks models upgrade -c system.ai.claude-haiku-4-5 --dry-run",
+            "recommend without switching",
+        ),
+    ),
+    ("models", "set"): (
+        ("agentbricks models set system.ai.claude-haiku-4-5", "switch the model by name"),
+    ),
     ("tracing", "list"): (
         (
             "agentbricks tracing list --experiment-name /Shared/agentbricks_traces/my-agent",

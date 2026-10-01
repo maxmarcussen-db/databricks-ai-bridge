@@ -31,6 +31,11 @@ SESSION_STORE_TABLE = "session_store"
 # init` bootstraps a default name.
 TRACING_TABLE = "tracing"
 EXPERIMENT_NAME_KEY = "experiment_name"
+# The model-service binding (`agentbricks models bind`): `name` is the user-owned UC model service the
+# agent calls (catalog.schema.name); `default` is the system.ai.* model deploy routes it to when it
+# first creates the service. `agentbricks models upgrade` / `set` repoint it afterwards.
+MODEL_SERVICE_TABLE = "model_service"
+MODEL_SERVICE_DEFAULT_KEY = "default"
 
 _SCHEMA_VERSION = 1
 _SUPPORTED_SCOPE_KINDS = {"table", "volume", "workspace"}
@@ -385,6 +390,8 @@ class AgentProject:
         memory_store_id: str | None = None,
         deployment_name: str | None = None,
         trace_experiment_name: str | None = None,
+        model_service: str | None = None,
+        model_service_default: str | None = None,
     ) -> None:
         self.root = root
         self.path = root / "agent.toml"
@@ -406,6 +413,10 @@ class AgentProject:
         # unbound, i.e. off. Storing a name (not an id) keeps the binding valid across workspaces and
         # profiles, since an id is workspace-local. `agentbricks init` bootstraps a default name.
         self.trace_experiment_name = trace_experiment_name
+        # Model-service binding: the UC model service the agent calls, and the model deploy routes it
+        # to on first create. None = unbound (the agent calls its template default model directly).
+        self.model_service = model_service
+        self.model_service_default = model_service_default
 
     @classmethod
     def load(cls, root: pathlib.Path | str | None = None) -> "AgentProject":
@@ -464,6 +475,21 @@ class AgentProject:
             trace_experiment_name = (
                 str(raw_experiment) if isinstance(raw_experiment, str) and raw_experiment else None
             )
+        model_service = _store_name_from_manifest(
+            document.get(MODEL_SERVICE_TABLE), MODEL_SERVICE_TABLE
+        )
+        if model_service is not None:
+            _three_part_name(model_service, "model service")
+        model_service_default: str | None = None
+        model_table = document.get(MODEL_SERVICE_TABLE)
+        if isinstance(model_table, Mapping):
+            raw_default = model_table.get(MODEL_SERVICE_DEFAULT_KEY)
+            if raw_default is not None and not (isinstance(raw_default, str) and raw_default):
+                raise AgentCliError(
+                    f"agent.toml [{MODEL_SERVICE_TABLE}] {MODEL_SERVICE_DEFAULT_KEY} must be a "
+                    "non-empty string."
+                )
+            model_service_default = str(raw_default) if raw_default else None
         return cls(
             project_root,
             document,
@@ -475,6 +501,8 @@ class AgentProject:
             memory_store_id,
             str(deployment_name) if deployment_name is not None else None,
             trace_experiment_name,
+            str(model_service) if model_service else None,
+            model_service_default,
         )
 
     @classmethod
@@ -583,6 +611,40 @@ class AgentProject:
     def unbind_session_store(self) -> bool:
         """Remove the session store binding from agent.toml. Returns True if it was present."""
         return self._clear_store(SESSION_STORE_TABLE)
+
+    def bind_model_service(self, name: str, default: str | None = None) -> bool:
+        """Declare the model-service binding in agent.toml. Returns True if it changed.
+
+        ``name`` is a three-part UC name (catalog.schema.name). ``default`` is the ``system.ai.*``
+        model `agentbricks deploy` routes the service to when it creates it; an existing service is never
+        repointed by deploy. Passing no ``default`` keeps any recorded one.
+        """
+        name = _three_part_name(_required_string(name, f"[{MODEL_SERVICE_TABLE}] name"), "model service")
+        default = default or self.model_service_default
+        if self.model_service == name and self.model_service_default == default:
+            return False
+        table = self._document.get(MODEL_SERVICE_TABLE)
+        if not isinstance(table, Mapping):
+            table = tomlkit.table()
+            self._document.append(MODEL_SERVICE_TABLE, table)
+        table["name"] = name
+        if default:
+            table[MODEL_SERVICE_DEFAULT_KEY] = default
+        elif MODEL_SERVICE_DEFAULT_KEY in table:
+            del table[MODEL_SERVICE_DEFAULT_KEY]
+        self.model_service = name
+        self.model_service_default = default
+        return True
+
+    def unbind_model_service(self) -> bool:
+        """Remove the model-service binding from agent.toml. Returns True if it was present."""
+        if self.model_service is None:
+            return False
+        if MODEL_SERVICE_TABLE in self._document:
+            del self._document[MODEL_SERVICE_TABLE]
+        self.model_service = None
+        self.model_service_default = None
+        return True
 
     def bind_tracing(self, experiment_name: str) -> bool:
         """Bind tracing to an MLflow experiment NAME (an experiment path). Returns True if changed.

@@ -464,6 +464,13 @@ agentbricks [-p <profile>] [-o text|json]
     list             [--kind sandbox|mcp|uc-function|genie-one|genie-agent]
                      [--schema CATALOG.SCHEMA]
     remove           TOOL_ID [MCP_SERVICE] [--source PATH]
+  models
+    bind       SERVICE [--default MODEL] [--source PATH]
+    unbind | list | status
+    set        MODEL [--yes]
+    rollback   [--yes]
+    upgrade    --candidates MODEL [...] [--traces N] [--budget N] [--weights Q,L,C]
+               [--dry-run] [--yes]
   deploy       [<name>] [--source PATH] [--instances N]
   deployments  list | get | logs | start | stop | delete
   endpoint

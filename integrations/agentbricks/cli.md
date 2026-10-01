@@ -70,6 +70,7 @@ These options apply to every command. Pass them before the command name, for exa
 | [`deployments`](#agentbricks-deployments) | Manage deployed agents |
 | [`endpoint`](#agentbricks-endpoint) | Invoke arbitrary HTTP endpoints. |
 | [`tools`](#agentbricks-tools) | Manage an agent's tools |
+| [`models`](#agentbricks-models) | Choose, evaluate, and upgrade the model behind your agent |
 
 ## Commands
 
@@ -1058,6 +1059,140 @@ _Options_
 | `--experiment-id <EXPERIMENT_ID>` | string | - | no | MLflow experiment id to read (e.g. from the experiment URL). Mutually exclusive with --experiment-name. |
 | `--warehouse <WAREHOUSE_ID>` | string | - | no | SQL warehouse id used to read traces from a UC-backed experiment (required for UC experiments; ignored for managed). Falls back to the MLFLOW_TRACING_SQL_WAREHOUSE_ID env var. |
 | `--source <SOURCE>` | path | `.` | no | Project directory to resolve the experiment from (default: current dir). |
+
+### `agentbricks models`
+
+Choose, evaluate, and upgrade the model behind your agent. The agent calls a Unity Catalog AI Gateway model service you own (`catalog.schema.name`, declared under `[model_service]` in agent.toml) instead of a hardcoded `system.ai.*` model. `agentbricks deploy` creates the service if it's missing (routed to the binding's default model), grants the app's service principal EXECUTE on it, and wires it in as `AGENT_MODEL_SERVICE`. After that, switching the model behind the service takes effect without a code change or redeploy. Every switch is recorded in `.agentbricks/model_upgrades.json` so it can be rolled back.
+
+| Subcommand | Description |
+| --- | --- |
+| [`models bind`](#agentbricks-models-bind) | Declare the agent's model service in agent.toml (creates nothing; deploy provisions it). |
+| [`models unbind`](#agentbricks-models-unbind) | Remove the model-service binding from agent.toml (the service is left in place). |
+| [`models list`](#agentbricks-models-list) | List the `system.ai.*` chat models you can route the agent to. |
+| [`models status`](#agentbricks-models-status) | Show the bound model service, the model behind it now, and its last switch. |
+| [`models set`](#agentbricks-models-set) | Switch the model service to a named model. |
+| [`models rollback`](#agentbricks-models-rollback) | Switch back to the model used before the last switch. |
+| [`models upgrade`](#agentbricks-models-upgrade) | Evaluate candidate models on the agent's own traces and switch to the best one. |
+
+#### `agentbricks models bind`
+
+Bind model service SERVICE to the agent by declaring it in agent.toml. This only edits agent.toml; `agentbricks deploy` creates the service if it doesn't exist, routed to `--default`. Deploy never repoints an existing service, so a redeploy can't undo an upgrade.
+
+```
+agentbricks models bind SERVICE [options]
+```
+
+_Arguments_
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `SERVICE` | yes | Three-part UC name: `catalog.schema.name`. |
+
+_Options_
+
+| Option | Values | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--default <MODEL>` | string | - | no | `system.ai.*` model deploy routes the service to when it creates it (the `system.ai.` prefix is optional). Omit to keep a recorded default. |
+| `--source <SOURCE>` | path | `.` | no | Agent Bricks project containing agent.toml. |
+
+#### `agentbricks models unbind`
+
+Remove the model-service binding from agent.toml. After the next deploy the agent calls its template default model directly again.
+
+```
+agentbricks models unbind [options]
+```
+
+_Options_
+
+| Option | Values | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--source <SOURCE>` | path | `.` | no | Agent Bricks project containing agent.toml. |
+
+#### `agentbricks models list`
+
+List the chat-capable `system.ai.*` models in the workspace.
+
+```
+agentbricks models list
+```
+
+#### `agentbricks models status`
+
+Show the bound model service, the model it routes to now, and its last recorded switch.
+
+```
+agentbricks models status [options]
+```
+
+_Options_
+
+| Option | Values | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--source <SOURCE>` | path | `.` | no | Agent Bricks project containing agent.toml. |
+
+#### `agentbricks models set`
+
+Switch the bound model service to MODEL. Prompts for confirmation; `-o json` switches only with `--yes`.
+
+```
+agentbricks models set MODEL [options]
+```
+
+_Arguments_
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `MODEL` | yes | A `system.ai.*` model (the prefix is optional). |
+
+_Options_
+
+| Option | Values | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--yes` (`-y`) | flag | - | no | Switch without asking for confirmation. |
+| `--source <SOURCE>` | path | `.` | no | Agent Bricks project containing agent.toml. |
+
+#### `agentbricks models rollback`
+
+Switch the model service back to the model it used before its last recorded switch.
+
+```
+agentbricks models rollback [options]
+```
+
+_Options_
+
+| Option | Values | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--yes` (`-y`) | flag | - | no | Switch without asking for confirmation. |
+| `--source <SOURCE>` | path | `.` | no | Agent Bricks project containing agent.toml. |
+
+#### `agentbricks models upgrade`
+
+Evaluate candidate models on the agent's own traces and switch to the best one. Reads the agent's recent successful traces from its bound trace experiment, replays each request through the project's agent code once per candidate against a temporary `<service>_exp` copy of the model service (production traffic is untouched), and scores each answer against what production returned with an LLM judge. The winner balances quality, latency, and cost (`--weights`); at equal quality the cheaper model wins. The current model is always the baseline. Evaluation runs log to the sibling MLflow experiment `<trace experiment>-model-upgrades`, never to the agent's own trace experiment.
+
+Runs locally from the project directory and needs the `upgrade` extra in the project's environment, since it imports the project's agent:
+
+```
+uv run --with 'databricks-agentbricks[upgrade]' agentbricks models upgrade -c system.ai.claude-haiku-4-5
+```
+
+```
+agentbricks models upgrade --candidates MODEL [options]
+```
+
+_Options_
+
+| Option | Values | Default | Required | Description |
+| --- | --- | --- | --- | --- |
+| `--candidates <MODEL>` (`-c`) | string | - | yes | `system.ai.*` model to evaluate. Repeat, or comma-separate. |
+| `--traces <N>` | integer >= 5 | `50` | no | Recent traces to build the eval set from (about 30% are held out for validation). |
+| `--budget <N>` | integer >= 1 | 4 x traces | no | Evaluation budget, in agent runs. |
+| `--judge-model <ENDPOINT>` | string | `databricks-claude-sonnet-4-6` | no | Model serving endpoint for the equivalence judge. |
+| `--weights <Q,L,C>` | string | `0.7,0.2,0.1` | no | Quality, latency, cost weights; non-negative, summing to 1. |
+| `--dry-run` | flag | - | no | Evaluate and recommend, but never switch. |
+| `--yes` (`-y`) | flag | - | no | Switch to the recommendation without asking. |
+| `--source <SOURCE>` | path | `.` | no | Agent Bricks project containing agent.toml. |
 
 ### `agentbricks deploy`
 

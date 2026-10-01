@@ -48,6 +48,13 @@ openai = [
     "opentelemetry-exporter-otlp-proto-grpc>=1.25.0",
     "databricks-agents>=1.9.3",
 ]
+# `agentbricks models upgrade`: the Smart Model Upgrades optimizer (GEPA) and full mlflow. Install it in
+# the agent project's environment, since the upgrade replays the project's own agent in-process.
+# PROTOTYPE: pinned to the Smart Model Upgrades repo until it ships as a package.
+upgrade = [
+    "smart-model-upgrades @ git+https://github.com/databricks-field-eng/smart-model-upgrades.git",
+    "mlflow>=3.11.0",
+]
 
 [project.scripts]
 agentbricks = "databricks_agentbricks.cli:main"
@@ -70,6 +77,10 @@ tests = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# The prototype `upgrade` extra pins smart-model-upgrades by git URL.
+allow-direct-references = true
 
 [tool.hatch.build]
 include = [
