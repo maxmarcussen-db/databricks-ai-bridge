@@ -60,10 +60,54 @@ def test_final_text(value, expected):
     assert model_upgrade.final_text(value) == expected
 
 
+def test_final_text_ignores_bare_strings_like_finish_reasons():
+    completion = {"choices": [{"message": {"role": "assistant", "content": "the answer"}, "finish_reason": "stop"}]}
+    assert model_upgrade.final_text(completion) == "the answer"
+    assert model_upgrade.final_text({"id": "abc", "object": "x"}) == ""
+
+
+def test_final_text_skips_trailing_middleware_updates():
+    # LangGraph replay: every node update in order; the last is the human-approval middleware.
+    updates = [
+        {"model": {"messages": [SimpleNamespace(type="ai", content="from the model")]}},
+        {"HumanInTheLoopMiddleware.after_model": None},
+    ]
+    assert model_upgrade.final_text(updates) == "from the model"
+
+
 def test_final_text_reads_message_objects():
     message = SimpleNamespace(type="ai", content="from an AIMessage")
     tool = SimpleNamespace(type="tool", content="tool output")
     assert model_upgrade.final_text({"tools": {"messages": [message, tool]}}) == "from an AIMessage"
+
+
+def _span(name, span_type, start, outputs):
+    return SimpleNamespace(name=name, span_type=span_type, start_time_ns=start, outputs=outputs)
+
+
+def test_trace_answer_falls_back_to_the_latest_model_reply():
+    # The real shape of a stock LangGraph-template trace (seen on e2-demo): the root output is the
+    # HITL middleware step; the answer is in the CHAT_MODEL span.
+    def reply(text):
+        return {"choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}]}
+
+    trace = SimpleNamespace(
+        info=SimpleNamespace(state="OK"),
+        data=SimpleNamespace(
+            request=json.dumps({"messages": [{"role": "user", "content": "q"}]}),
+            response=json.dumps({"HumanInTheLoopMiddleware.after_model": None}),
+            spans=[
+                _span("invoke", "UNKNOWN", 1, {"HumanInTheLoopMiddleware.after_model": None}),
+                _span("_RoutedChatDatabricks", "CHAT_MODEL", 2, reply("calling a tool")),
+                _span("_RoutedChatDatabricks", "CHAT_MODEL", 5, reply("final answer")),
+                _span("HumanInTheLoopMiddleware.after_model", "CHAIN", 7, None),
+            ],
+        ),
+    )
+    assert model_upgrade.trace_answer(trace) == "final answer"
+    assert model_upgrade.records_from_traces([trace])[0]["expectations"] == {
+        "expected_response": "final answer"
+    }
 
 
 def test_records_from_traces_keeps_ok_traces_with_answers():

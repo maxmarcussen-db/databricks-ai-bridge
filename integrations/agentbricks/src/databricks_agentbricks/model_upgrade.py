@@ -139,6 +139,11 @@ def bare_name(model: str) -> str:
 # --- answers --------------------------------------------------------------------
 
 _ASSISTANT_ROLES = {"assistant", "ai"}
+# Keys that hold the answer in the shapes agents and their traces produce: the OpenAI Agents root
+# output, LangGraph message lists and node updates, and OpenAI-style chat completions.
+_ANSWER_KEYS = ("output", "messages", "message", "choices", "update")
+# Span types whose outputs are a model's reply.
+_MODEL_SPAN_TYPES = {"CHAT_MODEL", "LLM"}
 
 
 def _content_text(content: Any) -> str:
@@ -173,11 +178,14 @@ def final_text(value: Any) -> str:
         role = value.get("role") or value.get("type")
         if "content" in value and role is not None:
             return _content_text(value["content"]) if role in _ASSISTANT_ROLES else ""
-        if "output" in value:
-            return final_text(value["output"])
-        if "messages" in value:
-            return final_text(value["messages"])
-        return final_text(list(value.values()))
+        for key in _ANSWER_KEYS:
+            if key in value:
+                text = final_text(value[key])
+                if text:
+                    return text
+        # Otherwise a {node: update} map: descend into structured values only, never into bare
+        # strings (ids, finish reasons), which aren't the answer.
+        return final_text([v for v in value.values() if isinstance(v, (dict, list, tuple))])
     role = getattr(value, "type", None) or getattr(value, "role", None)
     if hasattr(value, "content"):
         return _content_text(value.content) if role in _ASSISTANT_ROLES else ""
@@ -196,6 +204,30 @@ def _loads(raw: Any) -> Any:
     return raw
 
 
+def trace_answer(trace: Any) -> str:
+    """Production's final answer in ``trace``.
+
+    The root span's output when it holds one (the OpenAI Agents template's ``{"output": ...}``),
+    otherwise the latest model reply in the trace. The LangGraph template records its graph's *last*
+    update as the root output, which is a middleware step (e.g. ``{"HumanInTheLoopMiddleware.
+    after_model": null}``), not the answer.
+    """
+    data = getattr(trace, "data", None)
+    answer = final_text(_loads(getattr(data, "response", None)))
+    if answer:
+        return answer
+    spans = [
+        span
+        for span in getattr(data, "spans", None) or []
+        if str(getattr(span, "span_type", "")).upper() in _MODEL_SPAN_TYPES
+    ]
+    for span in sorted(spans, key=lambda s: getattr(s, "start_time_ns", 0) or 0, reverse=True):
+        answer = final_text(getattr(span, "outputs", None))
+        if answer:
+            return answer
+    return ""
+
+
 def records_from_traces(traces: Sequence[Any]) -> list[dict[str, Any]]:
     """Turn traces into optimizer records: the agent's input, and production's answer as reference.
 
@@ -210,7 +242,7 @@ def records_from_traces(traces: Sequence[Any]) -> list[dict[str, Any]]:
             continue
         data = getattr(trace, "data", None)
         request = _loads(getattr(data, "request", None))
-        reference = final_text(_loads(getattr(data, "response", None)))
+        reference = trace_answer(trace)
         if not request or not reference:
             continue
         records.append(
@@ -300,11 +332,13 @@ def make_predict_fn(
     if framework == AgentFramework.LANGGRAPH:
 
         async def _run(agent_input: Any) -> Any:
-            last = None
+            # Every node update, not just the last: the last is often a middleware step (e.g. the
+            # human-approval check) rather than the model's reply.
+            updates = []
             async for event in run_agent(agent_input, session_id=uuid.uuid4().hex):
                 if isinstance(event, tuple) and event and event[0] == "updates":
-                    last = event[1]
-            return last
+                    updates.append(event[1])
+            return updates
 
     else:
 
