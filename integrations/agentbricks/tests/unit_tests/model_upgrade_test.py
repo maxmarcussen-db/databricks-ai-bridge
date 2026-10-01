@@ -93,11 +93,80 @@ def test_split_records_needs_enough_traces():
 
 
 def test_history_round_trip(tmp_path):
-    assert model_upgrade.read_history(tmp_path) == []
+    assert model_upgrade.read_history(tmp_path) == {"runs": [], "changes": []}
+    model_upgrade.record_run(tmp_path, {"upgrade_id": "u1", "run_id": 7, "state": "PENDING"})
+    model_upgrade.update_run(tmp_path, "u1", state="SUCCESS")
     model_upgrade.record_change(
         tmp_path, service="a.b.c", previous="system.ai.x", model="system.ai.y", reason="set"
     )
-    (entry,) = model_upgrade.read_history(tmp_path)
+    history = model_upgrade.read_history(tmp_path)
+    assert history["runs"][0]["state"] == "SUCCESS"
+    (entry,) = history["changes"]
     assert entry["previous_model"] == "system.ai.x"
     assert entry["model"] == "system.ai.y"
     assert (tmp_path / ".agentbricks" / "model_upgrades.json").is_file()
+
+
+def test_job_config_round_trips_through_the_job_parameter():
+    config = model_upgrade.JobConfig(
+        upgrade_id="u1",
+        service="a.b.c",
+        framework="langgraph",
+        candidates=["system.ai.x"],
+        trace_experiment="/Shared/t",
+        trace_limit=50,
+        budget=None,
+        judge_model="databricks-claude-sonnet-4-6",
+        weights=(0.7, 0.2, 0.1),
+    )
+    assert model_upgrade.JobConfig.from_param(config.to_param()) == config
+
+
+def test_report_round_trips_through_json():
+    report = model_upgrade.UpgradeReport(
+        service="a.b.c",
+        current_model="system.ai.x",
+        recommended_model="system.ai.y",
+        baseline_score=0.5,
+        best_score=0.6,
+        model_scores={"system.ai.y": 0.6},
+        train_records=7,
+        val_records=3,
+    )
+    assert model_upgrade.UpgradeReport.from_json(report.to_json()) == report
+
+
+def test_upgrade_requirement_override(monkeypatch):
+    monkeypatch.setenv(model_upgrade.UPGRADE_REQUIREMENT_ENV, "databricks-agentbricks[upgrade] @ git+x")
+    assert model_upgrade.upgrade_requirement() == "databricks-agentbricks[upgrade] @ git+x"
+
+
+def test_submit_upgrade_run_uploads_runner_and_installs_project(monkeypatch):
+    monkeypatch.setenv(model_upgrade.UPGRADE_REQUIREMENT_ENV, "databricks-agentbricks[upgrade]==9.9")
+    class _Client:
+        def __init__(self):
+            self.uploaded, self.submitted = {}, {}
+
+        def upload_workspace_file(self, path, content):
+            self.uploaded[path] = content
+
+        def submit_serverless_python_run(self, **kwargs):
+            self.submitted = kwargs
+            return 9
+
+        def get_run(self, run_id):
+            return SimpleNamespace(run_page_url="https://ws/run/9")
+
+    client = _Client()
+    config = model_upgrade.JobConfig("u1", "a.b.c", "openai", ["system.ai.x"], "/Shared/t", 20, 40, "j", (1.0, 0.0, 0.0))
+    run_id, url = model_upgrade.submit_upgrade_run(client, workspace_path="/Workspace/Users/me/p", config=config)
+    assert (run_id, url) == (9, "https://ws/run/9")
+    runner = "/Workspace/Users/me/p/.agentbricks/model_upgrade_job.py"
+    assert "job_main" in client.uploaded[runner]
+    assert client.submitted["python_file"] == runner
+    assert client.submitted["parameters"] == ["/Workspace/Users/me/p", config.to_param()]
+    assert client.submitted["dependencies"] == [
+        "/Workspace/Users/me/p",
+        "databricks-agentbricks[upgrade]==9.9",
+    ]
+    assert client.submitted["environment_version"] == model_upgrade.SERVERLESS_ENVIRONMENT_VERSION

@@ -434,12 +434,15 @@ change without a code change or redeploy:
 agentbricks models bind main.my_agent.llm --default system.ai.claude-sonnet-4-5
 agentbricks deploy my-agent      # creates the service and grants the app EXECUTE on it
 agentbricks models upgrade -c system.ai.claude-haiku-4-5 -c system.ai.gpt-5-4-mini
+agentbricks models status        # the job's state, then its recommendation
+agentbricks models apply         # switch to it
 ```
 
-`models upgrade` replays the deployed agent's recent traces through your agent code once per
-candidate, against a temporary `<service>_exp` clone, scores each answer against production's with
-an LLM judge, and switches to the best quality / latency / cost trade-off when you confirm.
-`models rollback` undoes the last switch.
+`models upgrade` uploads the project to your workspace and runs the search as a serverless
+Databricks job (it can take hours, so it never runs locally). The job replays the deployed agent's
+recent traces through your agent code once per candidate, against a temporary `<service>_exp`
+clone, and scores each answer against production's with an LLM judge. `models apply` switches to
+the best quality / latency / cost trade-off; `models rollback` undoes the last switch.
 
 The search is `databricks_agentkit.model_upgrades`, which you can also call directly (for example
 from a notebook) to tune several model services and MLflow Prompt Registry prompts together:
@@ -511,7 +514,8 @@ agentbricks [-p <profile>] [-o text|json]
     set        MODEL [--yes]
     rollback   [--yes]
     upgrade    --candidates MODEL [...] [--traces N] [--budget N] [--weights Q,L,C]
-               [--dry-run] [--yes]
+               [--timeout-hours H] [--wait]
+    apply      [--yes]
   deploy       [<name>] [--source PATH] [--instances N]
   deployments  list | get | logs | start | stop | delete
   endpoint

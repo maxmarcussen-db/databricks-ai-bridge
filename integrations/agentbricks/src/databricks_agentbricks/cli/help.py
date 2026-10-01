@@ -290,8 +290,10 @@ _EXAMPLES: dict[CommandPath, tuple[Example, ...]] = {
         ),
         (
             "agentbricks models upgrade -c system.ai.claude-haiku-4-5 -c system.ai.gpt-5-4-mini",
-            "evaluate cheaper models on the agent's traces and switch to the best",
+            "evaluate cheaper models on the agent's traces, as a Databricks job",
         ),
+        ("agentbricks models status", "check on the job and see its recommendation"),
+        ("agentbricks models apply", "switch to the recommendation"),
         ("agentbricks models rollback", "undo the last switch"),
     ),
     ("models", "bind"): (
@@ -302,8 +304,8 @@ _EXAMPLES: dict[CommandPath, tuple[Example, ...]] = {
     ),
     ("models", "upgrade"): (
         (
-            "agentbricks models upgrade -c system.ai.claude-haiku-4-5 --dry-run",
-            "recommend without switching",
+            "agentbricks models upgrade -c system.ai.claude-haiku-4-5 --wait",
+            "submit the job and wait for its recommendation",
         ),
     ),
     ("models", "set"): (

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -148,6 +149,7 @@ def test_status_reports_current_destination(tmp_path):
     assert payload["model_service"] == SERVICE
     assert payload["model"] == "system.ai.claude-sonnet-4-5"
     assert payload["last_change"] is None
+    assert payload["latest_run"] is None
 
 
 def test_status_without_binding_points_at_bind(tmp_path):
@@ -173,7 +175,7 @@ def test_set_switches_and_records_history_then_rollback_restores(tmp_path):
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["changed"] is True
     assert client.model == "system.ai.claude-haiku-4-5"
-    history = model_upgrade.read_history(project)
+    history = model_upgrade.read_history(project)["changes"]
     assert history[-1]["previous_model"] == "system.ai.claude-sonnet-4-5"
     assert history[-1]["model"] == "system.ai.claude-haiku-4-5"
     assert history[-1]["reason"] == "set"
@@ -181,7 +183,7 @@ def test_set_switches_and_records_history_then_rollback_restores(tmp_path):
     result = _invoke(["rollback", "--yes", "--source", str(project)], _Ctx(client, "json"))
     assert result.exit_code == 0, result.output
     assert client.model == "system.ai.claude-sonnet-4-5"
-    assert model_upgrade.read_history(project)[-1]["reason"] == "rollback"
+    assert model_upgrade.read_history(project)["changes"][-1]["reason"] == "rollback"
 
 
 def test_set_json_without_yes_never_switches(tmp_path):
@@ -202,7 +204,7 @@ def test_set_to_current_model_is_a_no_op(tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert not any(call[0] == "set" for call in client.calls)
-    assert model_upgrade.read_history(project) == []
+    assert model_upgrade.read_history(project)["changes"] == []
 
 
 def test_rollback_with_no_history_errors(tmp_path):
@@ -212,7 +214,7 @@ def test_rollback_with_no_history_errors(tmp_path):
     assert "No recorded switch" in result.output
 
 
-# --- upgrade ----------------------------------------------------------------------------
+# --- upgrade (job) / status / apply ------------------------------------------------------
 
 
 def _report(recommended: str) -> model_upgrade.UpgradeReport:
@@ -228,77 +230,124 @@ def _report(recommended: str) -> model_upgrade.UpgradeReport:
     )
 
 
+class _JobClient(_FakeClient):
+    current_user = "me@example.com"
+
+    def __init__(self, life_cycle="RUNNING", result=None):
+        super().__init__()
+        self.life_cycle, self.result = life_cycle, result
+
+    def get_run(self, run_id):
+        state = SimpleNamespace(life_cycle_state=self.life_cycle, result_state=self.result)
+        return SimpleNamespace(state=state, run_page_url=f"https://ws/run/{run_id}")
+
+
 @pytest.fixture
-def stub_upgrade(monkeypatch):
-    calls = {}
+def stub_job(monkeypatch):
+    calls: dict = {"synced": []}
 
-    def _load_traces(profile, experiment_name, limit):
-        calls["load_traces"] = (profile, experiment_name, limit)
-        return ["t"] * 10
+    def _databricks(args, profile, **kwargs):
+        calls["synced"].append(args)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    def _run_upgrade(**kwargs):
-        calls["run_upgrade"] = kwargs
+    def _submit(client, *, workspace_path, config, timeout_hours):
+        calls["submit"] = (workspace_path, config, timeout_hours)
+        return 42, "https://ws/run/42"
+
+    def _fetch(profile, trace_experiment, upgrade_id):
+        calls["fetch"] = (trace_experiment, upgrade_id)
         return _report("system.ai.claude-haiku-4-5")
 
-    monkeypatch.setattr(model_upgrade, "load_traces", _load_traces)
-    monkeypatch.setattr(model_upgrade, "run_upgrade", _run_upgrade)
+    monkeypatch.setattr("databricks_agentbricks.databricks_cli._databricks", _databricks)
+    monkeypatch.setattr(model_upgrade, "submit_upgrade_run", _submit)
+    monkeypatch.setattr(model_upgrade, "fetch_report", _fetch)
     return calls
 
 
-def test_upgrade_switches_to_recommendation_with_yes(tmp_path, stub_upgrade):
+def test_upgrade_uploads_project_and_submits_job_without_switching(tmp_path, stub_job):
     project = _project(tmp_path)
-    client = _FakeClient()
+    client = _JobClient()
     result = _invoke(
-        ["upgrade", "-c", "claude-haiku-4-5,system.ai.gpt-5-4-mini", "--yes", "--source", str(project)],
+        ["upgrade", "-c", "claude-haiku-4-5,system.ai.gpt-5-4-mini", "--source", str(project)],
         _Ctx(client, "json"),
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["recommended_model"] == "system.ai.claude-haiku-4-5"
-    assert payload["switched"] is True
-    assert client.model == "system.ai.claude-haiku-4-5"
-    kwargs = stub_upgrade["run_upgrade"]
-    assert kwargs["service"] == SERVICE
-    assert kwargs["current_model"] == "system.ai.claude-sonnet-4-5"
-    assert kwargs["candidates"] == ["system.ai.claude-haiku-4-5", "system.ai.gpt-5-4-mini"]
-    assert kwargs["weights"] == (0.7, 0.2, 0.1)
-    assert kwargs["budget"] == 40
-    assert stub_upgrade["load_traces"][1] == "/Shared/agentbricks_traces/my-agent"
-    entry = model_upgrade.read_history(project)[-1]
-    assert entry["reason"] == "upgrade"
-    assert entry["best_score"] == pytest.approx(0.82)
+    assert payload["run_id"] == 42
+    assert payload["run"] is None  # returned once submitted
 
-
-def test_upgrade_dry_run_never_switches(tmp_path, stub_upgrade):
-    project = _project(tmp_path)
-    client = _FakeClient()
-    result = _invoke(
-        ["upgrade", "-c", "claude-haiku-4-5", "--dry-run", "--yes", "--source", str(project)],
-        _Ctx(client),
-    )
-    assert result.exit_code == 0, result.output
+    ((sync_args,),) = [stub_job["synced"]]
+    ws_path = "/Workspace/Users/me@example.com/agentbricks_model_upgrades/agent-langgraph"
+    assert sync_args[:3] == ["sync", str(project), ws_path]
+    submitted_path, config, timeout_hours = stub_job["submit"]
+    assert submitted_path == ws_path
+    assert config.service == SERVICE
+    assert config.framework == "langgraph"
+    assert config.candidates == ["system.ai.claude-haiku-4-5", "system.ai.gpt-5-4-mini"]
+    assert config.trace_experiment == "/Shared/agentbricks_traces/my-agent"
+    assert config.weights == (0.7, 0.2, 0.1)
+    assert timeout_hours == 6.0
+    # Submitting never switches the model.
     assert client.model == "system.ai.claude-sonnet-4-5"
-    assert "Recommended" in result.output
+    (run,) = model_upgrade.read_history(project)["runs"]
+    assert run["run_id"] == 42 and run["upgrade_id"] == config.upgrade_id
 
 
-def test_upgrade_requires_tracing(tmp_path, stub_upgrade):
+def test_status_then_apply_switches_to_finished_runs_recommendation(tmp_path, stub_job):
+    project = _project(tmp_path)
+    _invoke(["upgrade", "-c", "claude-haiku-4-5", "--source", str(project)], _Ctx(_JobClient(), "json"))
+
+    client = _JobClient(life_cycle="TERMINATED", result="SUCCESS")
+    status = _invoke(["status", "--source", str(project)], _Ctx(client, "json"))
+    assert status.exit_code == 0, status.output
+    latest = json.loads(status.output)["latest_run"]
+    assert latest["state"] == "SUCCESS"
+    assert latest["report"]["recommended_model"] == "system.ai.claude-haiku-4-5"
+
+    applied = _invoke(["apply", "--yes", "--source", str(project)], _Ctx(client, "json"))
+    assert applied.exit_code == 0, applied.output
+    assert json.loads(applied.output)["changed"] is True
+    assert client.model == "system.ai.claude-haiku-4-5"
+    change = model_upgrade.read_history(project)["changes"][-1]
+    assert change["reason"] == "upgrade"
+    assert change["best_score"] == pytest.approx(0.82)
+
+
+def test_apply_before_the_run_finishes_refuses(tmp_path, stub_job):
+    project = _project(tmp_path)
+    _invoke(["upgrade", "-c", "claude-haiku-4-5", "--source", str(project)], _Ctx(_JobClient(), "json"))
+    client = _JobClient(life_cycle="RUNNING")
+    result = _invoke(["apply", "--yes", "--source", str(project)], _Ctx(client))
+    assert result.exit_code != 0
+    assert "no recommendation" in result.output
+    assert client.model == "system.ai.claude-sonnet-4-5"
+
+
+def test_apply_with_no_runs_errors(tmp_path):
+    project = _project(tmp_path)
+    result = _invoke(["apply", "--yes", "--source", str(project)], _Ctx(_JobClient()))
+    assert result.exit_code != 0
+    assert "No upgrade run" in result.output
+
+
+def test_upgrade_requires_tracing(tmp_path, stub_job):
     project = _project(tmp_path, tracing=False)
     result = _invoke(
-        ["upgrade", "-c", "claude-haiku-4-5", "--source", str(project)], _Ctx(_FakeClient())
+        ["upgrade", "-c", "claude-haiku-4-5", "--source", str(project)], _Ctx(_JobClient())
     )
     assert result.exit_code != 0
     assert "tracing" in result.output
-    assert "run_upgrade" not in stub_upgrade
+    assert "submit" not in stub_job
 
 
-def test_upgrade_rejects_bad_weights(tmp_path, stub_upgrade):
+def test_upgrade_rejects_bad_weights(tmp_path, stub_job):
     project = _project(tmp_path)
     result = _invoke(
         ["upgrade", "-c", "claude-haiku-4-5", "--weights", "0.5,0.5,0.5", "--source", str(project)],
-        _Ctx(_FakeClient()),
+        _Ctx(_JobClient()),
     )
     assert result.exit_code != 0
-    assert "run_upgrade" not in stub_upgrade
+    assert "submit" not in stub_job
 
 
 def test_list_shows_chat_models(tmp_path):
