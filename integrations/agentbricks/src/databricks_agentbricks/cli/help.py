@@ -295,7 +295,7 @@ _EXAMPLES: dict[CommandPath, tuple[Example, ...]] = {
         ),
         ("agentbricks models status", "check on the job and see its recommendation"),
         ("agentbricks models apply", "apply the recommendation"),
-        ("agentbricks models rollback", "undo the last switch"),
+        ("agentbricks models rollback", "undo the last apply or set"),
     ),
     ("models", "bind"): (
         (
@@ -329,7 +329,8 @@ _EXAMPLES: dict[CommandPath, tuple[Example, ...]] = {
         ("agentbricks models set claude-haiku-4-5 --role router", "switch one role's model"),
     ),
     ("models", "rollback"): (
-        ("agentbricks models rollback --role router", "undo one role's last switch"),
+        ("agentbricks models rollback", "undo the last apply: its models and prompts"),
+        ("agentbricks models rollback --role router", "undo one role's last model switch"),
     ),
     ("tracing", "list"): (
         (

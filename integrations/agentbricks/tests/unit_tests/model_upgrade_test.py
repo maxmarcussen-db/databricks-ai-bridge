@@ -40,8 +40,24 @@ def test_load_scorers_flattens_lists(tmp_path):
     assert model_upgrade._load_scorers(tmp_path, refs) == ["a", "b", "c"]
 
 
+def test_actions_are_undone_newest_first(tmp_path):
+    assert model_upgrade.last_undoable_action(tmp_path) is None
+    model_upgrade.record_action(tmp_path, "set", models=[{"model_service": "a.b.c"}])
+    model_upgrade.record_action(
+        tmp_path,
+        "apply",
+        models=[],
+        prompts=[{"name": "a.b.p", "alias": "production", "prior_version": 2}],
+    )
+    index, action = model_upgrade.last_undoable_action(tmp_path)
+    assert (index, action["kind"]) == (1, "apply")
+    model_upgrade.mark_rolled_back(tmp_path, index)
+    index, action = model_upgrade.last_undoable_action(tmp_path)
+    assert (index, action["kind"]) == (0, "set")
+
+
 def test_history_round_trip(tmp_path):
-    assert model_upgrade.read_history(tmp_path) == {"runs": [], "changes": []}
+    assert model_upgrade.read_history(tmp_path) == {"runs": [], "changes": [], "actions": []}
     model_upgrade.record_run(tmp_path, {"upgrade_id": "u1", "run_id": 7, "state": "PENDING"})
     model_upgrade.update_run(tmp_path, "u1", state="SUCCESS")
     model_upgrade.record_change(

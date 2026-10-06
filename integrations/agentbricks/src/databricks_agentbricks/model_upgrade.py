@@ -440,18 +440,26 @@ def fetch_report(
 # --- history (runs, switches, rollback) ---------------------------------------------
 
 
+_HISTORY_KEYS = ("runs", "changes", "actions")
+
+
 def read_history(root: pathlib.Path) -> dict[str, list[dict[str, Any]]]:
-    """The project's upgrade history: submitted ``runs`` and model-service ``changes``."""
+    """The project's upgrade history.
+
+    ``runs`` are submitted upgrade jobs, ``changes`` are individual model-service repoints, and
+    ``actions`` are what `models rollback` undoes: one entry per `apply` or `set`, holding every
+    model switch and prompt-alias move it made.
+    """
     path = root / HISTORY_PATH
     try:
         history = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {"runs": [], "changes": []}
+        return {key: [] for key in _HISTORY_KEYS}
     except (OSError, json.JSONDecodeError) as exc:
         raise AgentCliError(f"Could not read model upgrade history at {path}: {exc}.") from exc
     if not isinstance(history, dict):
-        return {"runs": [], "changes": []}
-    return {"runs": list(history.get("runs") or []), "changes": list(history.get("changes") or [])}
+        return {key: [] for key in _HISTORY_KEYS}
+    return {key: list(history.get(key) or []) for key in _HISTORY_KEYS}
 
 
 def _write_history(root: pathlib.Path, history: dict[str, list[dict[str, Any]]]) -> None:
@@ -498,4 +506,40 @@ def record_change(
         entry["best_score"] = report.best_score
     history = read_history(root)
     history["changes"].append(entry)
+    _write_history(root, history)
+
+
+def record_action(
+    root: pathlib.Path,
+    kind: str,
+    *,
+    models: Sequence[dict[str, Any]],
+    prompts: Sequence[dict[str, Any]] = (),
+) -> None:
+    """Append one undoable action: ``models`` as {model_service, previous_model, model}, ``prompts``
+    as {name, alias, prior_version} (the version the alias pointed at before the action)."""
+    history = read_history(root)
+    history["actions"].append(
+        {
+            "timestamp": int(time.time()),
+            "kind": kind,
+            "models": list(models),
+            "prompts": list(prompts),
+            "rolled_back": False,
+        }
+    )
+    _write_history(root, history)
+
+
+def last_undoable_action(root: pathlib.Path) -> Optional[tuple[int, dict[str, Any]]]:
+    """``(index, action)`` of the latest action not yet rolled back, or None."""
+    for index, action in reversed(list(enumerate(read_history(root)["actions"]))):
+        if not action.get("rolled_back"):
+            return index, action
+    return None
+
+
+def mark_rolled_back(root: pathlib.Path, index: int) -> None:
+    history = read_history(root)
+    history["actions"][index]["rolled_back"] = True
     _write_history(root, history)

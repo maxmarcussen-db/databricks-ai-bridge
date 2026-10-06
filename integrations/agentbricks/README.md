@@ -448,10 +448,11 @@ Databricks job (it can take hours, so it never runs locally). The job imports th
 eval data, and scorers you name from the project (the same inputs `optimize_prompts_and_models`
 takes, below) and runs each eval record once per candidate, against a temporary `<service>_exp`
 clone. Each LLM call must use its role's service, `resolve_model_service("<role>")`, which reads the
-`AGENT_MODEL_SERVICE_<ROLE>` env var that deploy (and the job, before importing your code) sets. With `--prompt`, GEPA rewrites those prompts for each
-candidate model too. `models apply` switches to the best quality / latency / cost trade-off and
-registers any rewritten prompts (prior versions keep `@production_previous`); `models rollback`
-undoes the last model switch.
+`AGENT_MODEL_SERVICE_<ROLE>` env var that deploy (and the job, before importing your code) sets.
+With `--prompt`, GEPA rewrites those prompts for each candidate model too. `models apply` switches
+to the best quality / latency / cost trade-off and registers any rewritten prompts (prior versions
+keep `@production_previous`). `models rollback` undoes the whole last apply: it switches every
+model back and moves each prompt's alias back to its prior version.
 
 The search is `databricks_agentkit.model_upgrades`, which you can also call directly (for example
 from a notebook) to tune several model services and MLflow Prompt Registry prompts together:

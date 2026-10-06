@@ -1083,7 +1083,7 @@ default = "system.ai.claude-sonnet-4-5"
 | [`models list`](#agentbricks-models-list) | List the `system.ai.*` chat models you can route the agent to. |
 | [`models status`](#agentbricks-models-status) | Show each bound model service, the model behind it now, and the latest upgrade run with its recommendation. |
 | [`models set`](#agentbricks-models-set) | Switch one model service to a named model. |
-| [`models rollback`](#agentbricks-models-rollback) | Switch one model service back to the model it used before its last switch. |
+| [`models rollback`](#agentbricks-models-rollback) | Undo the last apply or set: every model it switched and every prompt alias it moved. |
 | [`models upgrade`](#agentbricks-models-upgrade) | Search models for every role, and optionally rewritten prompts, together, as a Databricks job. |
 | [`models apply`](#agentbricks-models-apply) | Apply the latest finished upgrade run's recommendation: every model and prompt it changed. |
 
@@ -1170,7 +1170,7 @@ _Options_
 
 #### `agentbricks models rollback`
 
-Switch one model service back to the model it used before its last recorded switch.
+Undo the last `models apply` or `models set`. Every model service the action switched goes back to its previous model, and every prompt alias it moved (for example `@production`) goes back to the version it pointed at before, the one `@production_previous` marks. Run it again to undo the action before that. Refuses if a model was switched again after the action. Moving prompt aliases needs the `upgrade` extra installed locally.
 
 ```
 agentbricks models rollback [options]
@@ -1180,7 +1180,7 @@ _Options_
 
 | Option | Values | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--role <ROLE>` | string | only bound role | no | Which bound LLM call site. Required when more than one role is bound. |
+| `--role <ROLE>` | string | - | no | Roll back only this role's last model switch; prompts are left alone. |
 | `--yes` (`-y`) | flag | - | no | Switch without asking for confirmation. |
 | `--source <SOURCE>` | path | `.` | no | Agent Bricks project containing agent.toml. |
 

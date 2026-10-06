@@ -268,9 +268,13 @@ def _report(recommended: str, **roles: str) -> model_upgrade.UpgradeReport:
     )
 
 
+PROMPT_MOVE = {"name": "main.my_agent.system", "alias": "production", "prior_version": 3}
+
+
 @pytest.fixture
 def stub_promote(monkeypatch):
-    """Stand-in for promote_to_prod: switch each changed service on the fake client."""
+    """Stand-in for promote_to_prod: switch each changed service on the fake client, and report a
+    prompt-alias move for every prompt the report rewrote."""
     promoted: list = []
 
     def _promote(obj, report):
@@ -278,9 +282,21 @@ def stub_promote(monkeypatch):
         for rec in report.recommendations.values():
             if rec.changed:
                 obj.client().set_model_service_model(rec.service, rec.recommended_model)
+        return [dict(PROMPT_MOVE, name=name) for name in report.prompt_changes]
 
     monkeypatch.setattr("databricks_agentbricks.cli.models._promote", _promote)
     return promoted
+
+
+@pytest.fixture
+def stub_restore(monkeypatch):
+    """Records the prompt-alias moves `models rollback` reverses."""
+    restored: list = []
+    monkeypatch.setattr(
+        "databricks_agentbricks.cli.models._restore_prompts",
+        lambda obj, prompts: restored.extend(prompts),
+    )
+    return restored
 
 
 class _JobClient(_FakeClient):
@@ -595,3 +611,91 @@ def test_apply_refuses_when_a_service_moved_since_the_run(
     assert result.exit_code != 0
     assert "switched models after" in result.output
     assert stub_promote == []
+
+
+# --- rollback undoes the whole last action --------------------------------------------------
+
+
+def _applied(tmp_path, monkeypatch, report, *, compound=False):
+    """A project whose latest upgrade run (``report``) has been applied."""
+    monkeypatch.setattr(model_upgrade, "fetch_report", lambda *args: report)
+    project = _project(tmp_path, compound=compound)
+    client = _JobClient(life_cycle="TERMINATED", result="SUCCESS")
+    candidates = "router=claude-haiku-4-5" if compound else "claude-haiku-4-5"
+    _invoke(
+        ["upgrade", *_EVAL_FLAGS, "-c", candidates, "--source", str(project)],
+        _Ctx(client, "json"),
+    )
+    result = _invoke(["apply", "--yes", "--source", str(project)], _Ctx(client, "json"))
+    assert result.exit_code == 0, result.output
+    return project, client
+
+
+def test_rollback_undoes_the_models_and_prompts_an_apply_changed(
+    tmp_path, stub_job, stub_promote, stub_restore, monkeypatch
+):
+    report = _report("system.ai.claude-haiku-4-5")
+    report.prompt_changes = ["main.my_agent.system"]
+    project, client = _applied(tmp_path, monkeypatch, report)
+    assert client.model == "system.ai.claude-haiku-4-5"
+
+    result = _invoke(["rollback", "--yes", "--source", str(project)], _Ctx(client, "json"))
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["undid"] == "apply"
+    assert client.model == "system.ai.claude-sonnet-4-5"
+    assert stub_restore == [PROMPT_MOVE]  # @production back on the version before the apply
+    (action,) = model_upgrade.read_history(project)["actions"]
+    assert action["rolled_back"] is True
+
+    again = _invoke(["rollback", "--yes", "--source", str(project)], _Ctx(client))
+    assert again.exit_code != 0
+    assert "No recorded switch or upgrade" in again.output
+
+
+def test_rollback_after_a_compound_apply_restores_every_switched_role(
+    tmp_path, stub_job, stub_promote, stub_restore, monkeypatch
+):
+    report = _report(
+        "", router="system.ai.claude-haiku-4-5", writer="system.ai.gpt-5-4-mini"
+    )
+    project, client = _applied(tmp_path, monkeypatch, report, compound=True)
+    assert client.models == {ROUTER: "system.ai.claude-haiku-4-5", WRITER: "system.ai.gpt-5-4-mini"}
+
+    result = _invoke(["rollback", "--yes", "--source", str(project)], _Ctx(client, "json"))
+    assert result.exit_code == 0, result.output
+    assert client.models == {
+        ROUTER: "system.ai.claude-sonnet-4-5",
+        WRITER: "system.ai.claude-sonnet-4-5",
+    }
+    assert stub_restore == []  # nothing to move: the apply rewrote no prompts
+
+
+def test_rollback_with_a_role_switches_only_that_model(
+    tmp_path, stub_job, stub_promote, stub_restore, monkeypatch
+):
+    report = _report(
+        "", router="system.ai.claude-haiku-4-5", writer="system.ai.gpt-5-4-mini"
+    )
+    report.prompt_changes = ["main.my_agent.system"]
+    project, client = _applied(tmp_path, monkeypatch, report, compound=True)
+
+    result = _invoke(
+        ["rollback", "--role", "router", "--yes", "--source", str(project)], _Ctx(client, "json")
+    )
+    assert result.exit_code == 0, result.output
+    assert client.models == {
+        ROUTER: "system.ai.claude-sonnet-4-5",
+        WRITER: "system.ai.gpt-5-4-mini",
+    }
+    assert stub_restore == []
+
+
+def test_rollback_refuses_when_a_model_moved_since_the_action(
+    tmp_path, stub_job, stub_promote, stub_restore, monkeypatch
+):
+    project, client = _applied(tmp_path, monkeypatch, _report("system.ai.claude-haiku-4-5"))
+    client.models[SERVICE] = "system.ai.gpt-5-4-mini"
+    result = _invoke(["rollback", "--yes", "--source", str(project)], _Ctx(client))
+    assert result.exit_code != 0
+    assert "switched models after the last apply" in result.output
+    assert stub_restore == []

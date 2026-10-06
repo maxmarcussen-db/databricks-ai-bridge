@@ -13,7 +13,8 @@ repointed here, with no code change or redeploy:
 - ``models status`` shows the latest run and, once it finishes, its recommendation per role;
 - ``models apply`` promotes that recommendation (quality / latency / cost weighted) with the
   optimizer's ``promote_to_prod``; ``models set`` switches one role to a named model;
-  ``models rollback`` undoes a role's last switch.
+  ``models rollback`` undoes the last apply or set: every model it switched and every prompt alias
+  it moved (or, with ``--role``, just that role's last model switch).
 
 Runs and switches are recorded in ``.agentbricks/model_upgrades.json``.
 """
@@ -129,19 +130,33 @@ def _confirm(obj, yes: bool, question: str) -> bool:
     return click.confirm(question, default=False)
 
 
-def _promote(obj, report) -> None:
+def _registry_mlflow(obj):
+    """MLflow pointed at the workspace and its Unity Catalog prompt registry, honoring --profile."""
+    import os  # noqa: PLC0415
+
+    from databricks_agentbricks.cli import tracing  # noqa: PLC0415
+
+    if obj.profile:
+        # promote_to_prod's workspace client and MLflow both resolve auth from the environment.
+        os.environ["DATABRICKS_CONFIG_PROFILE"] = obj.profile
+    mlflow = tracing._mlflow()
+    tracing._set_tracking_uri(mlflow, obj.profile)
+    mlflow.set_registry_uri("databricks-uc")
+    return mlflow
+
+
+def _promote(obj, report) -> list[dict]:
     """Apply an upgrade report with the optimizer's own ``promote_to_prod``.
 
     It repoints every model service whose model changed, registers each rewritten prompt as a new
     version and moves its alias there (the prior version keeps ``@production_previous``), and rolls
-    all of it back if any step fails.
+    all of it back if any step fails. Returns the prompt-alias moves it made, as
+    {name, alias, prior_version}, so `models rollback` can move them back.
     """
     import contextlib  # noqa: PLC0415
-    import os  # noqa: PLC0415
     import sys  # noqa: PLC0415
 
     from databricks_agentbricks import model_upgrade  # noqa: PLC0415
-    from databricks_agentbricks.cli import tracing  # noqa: PLC0415
 
     try:
         from databricks_agentkit.model_upgrades import promote_to_prod  # noqa: PLC0415
@@ -150,17 +165,28 @@ def _promote(obj, report) -> None:
             "Applying an upgrade requires the 'upgrade' extra.",
             hint=model_upgrade.UPGRADE_EXTRA_HINT,
         ) from exc
-    if obj.profile:
-        # promote_to_prod's workspace client and MLflow both resolve auth from the environment.
-        os.environ["DATABRICKS_CONFIG_PROFILE"] = obj.profile
-    mlflow = tracing._mlflow()
-    tracing._set_tracking_uri(mlflow, obj.profile)
-    mlflow.set_registry_uri("databricks-uc")
+    _registry_mlflow(obj)
     result = model_upgrade.load_promotion(str(report.mlflow_run_id))
     # promote_to_prod prints its plan; keep stdout clean for -o json.
     with render.status("Applying the recommendation…"):
         with contextlib.redirect_stdout(sys.stderr):
             promote_to_prod(result)
+    return [
+        {"name": target.name, "alias": target.alias, "prior_version": target.prior_version}
+        for target in result.prompt_targets
+        if target.alias
+        and result.best_candidate.get(f"prompt:{target.short_name}") not in (None, target.template)
+    ]
+
+
+def _restore_prompts(obj, prompts: list[dict]) -> None:
+    """Move each prompt's alias back to the version it pointed at before an apply."""
+    mlflow = _registry_mlflow(obj)
+    with render.status("Moving prompt aliases back…"):
+        for prompt in prompts:
+            mlflow.genai.set_prompt_alias(
+                name=prompt["name"], alias=prompt["alias"], version=prompt["prior_version"]
+            )
 
 
 @click.group()
@@ -317,6 +343,7 @@ def models_status(obj, source: pathlib.Path) -> None:
 @click.pass_obj
 def models_set(obj, model: str, role: Optional[str], yes: bool, source: pathlib.Path) -> None:
     """Switch one bound model service to MODEL (a system.ai.* name)."""
+    from databricks_agentbricks import model_upgrade  # noqa: PLC0415
     from databricks_agentbricks.model_upgrade import system_ai_name  # noqa: PLC0415
 
     project = _bound_project(source)
@@ -335,6 +362,11 @@ def models_set(obj, model: str, role: Optional[str], yes: bool, source: pathlib.
             return
         raise click.Abort()
     _switch(obj, project, service, previous, model, reason="set")
+    model_upgrade.record_action(
+        project.root,
+        "set",
+        models=[{"model_service": service, "previous_model": previous, "model": model}],
+    )
     if obj.output == "json":
         render.emit_json(
             {"model_service": service, "previous_model": previous, "model": model, "changed": True}
@@ -348,16 +380,77 @@ def models_set(obj, model: str, role: Optional[str], yes: bool, source: pathlib.
 
 
 @models.command("rollback")
-@_role_option
+@click.option(
+    "--role",
+    default=None,
+    help="Roll back only this role's last model switch. Without it, undo the whole last apply or "
+    "set: every model it switched and every prompt alias it moved.",
+)
 @_yes_option
 @_source_option
 @click.pass_obj
 def models_rollback(obj, role: Optional[str], yes: bool, source: pathlib.Path) -> None:
-    """Switch one model service back to the model it used before its last switch."""
+    """Undo the last `models apply` or `models set`.
+
+    Switches every model service the action changed back to its previous model, and moves each
+    prompt alias it moved (e.g. @production) back to the version it pointed at before, the one
+    @production_previous marks. Run it again to undo the action before that. With --role, only
+    that role's last model switch is undone and prompts are left alone.
+    """
     from databricks_agentbricks import model_upgrade  # noqa: PLC0415
 
     project = _bound_project(source)
-    service = project.model_services[_pick_role(project, role)].name
+    if role is not None:
+        _rollback_role(obj, project, project.model_services[_pick_role(project, role)].name, yes)
+        return
+    found = model_upgrade.last_undoable_action(project.root)
+    if found is None:
+        raise AgentCliError("No recorded switch or upgrade to roll back.")
+    index, action = found
+    client = obj.client()
+    moved = [
+        m["model_service"]
+        for m in action["models"]
+        if _current_model(client, m["model_service"]) != m["model"]
+    ]
+    if moved:
+        raise AgentCliError(
+            f"{', '.join(moved)} switched models after the last {action['kind']}.",
+            hint="Roll those back one at a time with `agentbricks models rollback --role <role>`, "
+            "or switch them with `agentbricks models set`.",
+        )
+    undo = [
+        f"{m['model_service']}: {m['model']} → {m['previous_model']}" for m in action["models"]
+    ] + [f"{p['name']}@{p['alias']} → version {p['prior_version']}" for p in action["prompts"]]
+    if not _confirm(obj, yes, f"Undo the last {action['kind']}: " + "; ".join(undo) + "?"):
+        if obj.output == "json":
+            render.emit_json({"changed": False})
+            return
+        raise click.Abort()
+    for m in action["models"]:
+        _switch(
+            obj, project, m["model_service"], m["model"], m["previous_model"], reason="rollback"
+        )
+    if action["prompts"]:
+        _restore_prompts(obj, action["prompts"])
+    model_upgrade.mark_rolled_back(project.root, index)
+    if obj.output == "json":
+        render.emit_json(
+            {
+                "changed": True,
+                "undid": action["kind"],
+                "models": action["models"],
+                "prompts": action["prompts"],
+            }
+        )
+        return
+    render.success(f"Rolled back the last {action['kind']}", fields={"Undid": "; ".join(undo)})
+
+
+def _rollback_role(obj, project, service: str, yes: bool) -> None:
+    """Switch one model service back to the model it used before its last switch."""
+    from databricks_agentbricks import model_upgrade  # noqa: PLC0415
+
     history = [
         h for h in model_upgrade.read_history(project.root)["changes"] if h.get("model_service") == service
     ]
@@ -743,7 +836,21 @@ def models_apply(obj, yes: bool, source: pathlib.Path) -> None:
             render.emit_json({"changed": False})
             return
         raise click.Abort()
-    _promote(obj, report)
+    prompt_moves = _promote(obj, report)
+    model_upgrade.record_action(
+        project.root,
+        "apply",
+        models=[
+            {
+                "model_service": rec.service,
+                "previous_model": rec.current_model,
+                "model": rec.recommended_model,
+            }
+            for rec in report.recommendations.values()
+            if rec.changed
+        ],
+        prompts=prompt_moves,
+    )
     for rec in report.recommendations.values():
         if rec.changed:
             model_upgrade.record_change(
@@ -777,5 +884,5 @@ def models_apply(obj, yes: bool, source: pathlib.Path) -> None:
     render.success(
         "Upgraded the agent",
         fields=fields,
-        next_steps=[("agentbricks models rollback --role <role>", "Switch a model back")],
+        next_steps=[("agentbricks models rollback", "Undo all of it")],
     )
