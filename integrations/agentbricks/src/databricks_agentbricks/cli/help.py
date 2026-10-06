@@ -289,11 +289,12 @@ _EXAMPLES: dict[CommandPath, tuple[Example, ...]] = {
             "call a model service you own (deploy creates it)",
         ),
         (
-            "agentbricks models upgrade -c system.ai.claude-haiku-4-5 -c system.ai.gpt-5-4-mini",
-            "evaluate cheaper models on the agent's traces, as a Databricks job",
+            "agentbricks models upgrade -c claude-haiku-4-5 --predict agent.eval:predict "
+            "--train-data agent.eval:TRAIN --val-data agent.eval:VAL --scorer agent.eval:SCORERS",
+            "search models (and prompts) on your eval set, as a Databricks job",
         ),
         ("agentbricks models status", "check on the job and see its recommendation"),
-        ("agentbricks models apply", "switch to the recommendation"),
+        ("agentbricks models apply", "apply the recommendation"),
         ("agentbricks models rollback", "undo the last switch"),
     ),
     ("models", "bind"): (
@@ -301,15 +302,34 @@ _EXAMPLES: dict[CommandPath, tuple[Example, ...]] = {
             "agentbricks models bind main.my_agent.llm --default system.ai.claude-sonnet-4-5",
             "declare the agent's model service in agent.toml",
         ),
-    ),
-    ("models", "upgrade"): (
         (
-            "agentbricks models upgrade -c system.ai.claude-haiku-4-5 --wait",
-            "submit the job and wait for its recommendation",
+            "agentbricks models bind main.my_agent.router_llm --role router "
+            "--default system.ai.claude-haiku-4-5",
+            "one service per LLM call in a compound agent",
         ),
     ),
+    ("models", "unbind"): (
+        ("agentbricks models unbind", "remove the agent's only binding"),
+        ("agentbricks models unbind --role router", "remove one role's binding"),
+    ),
+    ("models", "list"): (("agentbricks models list", "models you can route a service to"),),
+    ("models", "status"): (("agentbricks models status", "each role's model and the latest run"),),
+    ("models", "upgrade"): (
+        (
+            "agentbricks models upgrade -c router=claude-haiku-4-5,gpt-5-4-nano "
+            "-c writer=claude-haiku-4-5 --prompt prompts:/main.my_agent.writer@production "
+            "--predict agent.eval:predict --train-data agent.eval:TRAIN "
+            "--val-data agent.eval:VAL --scorer agent.eval:SCORERS",
+            "search every role's model and a prompt together",
+        ),
+    ),
+    ("models", "apply"): (("agentbricks models apply", "promote every model and prompt that won"),),
     ("models", "set"): (
         ("agentbricks models set system.ai.claude-haiku-4-5", "switch the model by name"),
+        ("agentbricks models set claude-haiku-4-5 --role router", "switch one role's model"),
+    ),
+    ("models", "rollback"): (
+        ("agentbricks models rollback --role router", "undo one role's last switch"),
     ),
     ("tracing", "list"): (
         (

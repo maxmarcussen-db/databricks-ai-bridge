@@ -1,7 +1,7 @@
 """CLI tests for `agentbricks models` (bind / unbind / status / set / rollback / upgrade).
 
-Uses a real temp AgentProject and a fake client holding one model service's destination. The
-optimizer itself is stubbed: `model_upgrade_test.py` covers the trace and answer handling.
+Uses a real temp AgentProject and a fake client holding each model service's destination. The
+optimizer and `promote_to_prod` are stubbed: `model_upgrade_test.py` covers the engine.
 """
 
 from __future__ import annotations
@@ -14,17 +14,19 @@ import pytest
 from click.testing import CliRunner
 
 from databricks_agentbricks import model_upgrade
-from databricks_agentbricks.agent_project import AgentProject
+from databricks_agentbricks.agent_project import AgentProject, ModelServiceBinding
 from databricks_agentbricks.cli.models import models
 from databricks_agentbricks.errors import AgentCliError
 from databricks_agentbricks.project_config import write_project_metadata
 
 SERVICE = "main.my_agent.llm"
+ROUTER = "main.my_agent.router_llm"
+WRITER = "main.my_agent.writer_llm"
 
 
-def _service(model: str) -> dict:
+def _service(model: str, name: str = SERVICE) -> dict:
     return {
-        "name": f"model-services/{SERVICE}",
+        "name": f"model-services/{name}",
         "config": {
             "routing": {
                 "destinations": [
@@ -41,20 +43,28 @@ def _service(model: str) -> dict:
 
 
 class _FakeClient:
+    """Each model service starts on ``model``; ``models`` tracks per-service switches."""
+
     def __init__(self, model: str | None = "system.ai.claude-sonnet-4-5"):
-        self.model = model
+        self.default_model = model
+        self.models: dict[str, str] = {}
         self.calls: list[tuple] = []
+
+    @property
+    def model(self) -> str | None:
+        return self.models.get(SERVICE, self.default_model)
 
     def get_model_service(self, name):
         self.calls.append(("get", name))
-        if self.model is None:
+        model = self.models.get(name, self.default_model)
+        if model is None:
             raise AgentCliError("not found", error_code="NOT_FOUND")
-        return _service(self.model)
+        return _service(model, name)
 
     def set_model_service_model(self, name, model):
         self.calls.append(("set", name, model))
-        self.model = model
-        return _service(model)
+        self.models[name] = model
+        return _service(model, name)
 
     def list_chat_model_services(self):
         return ["system.ai.claude-haiku-4-5", "system.ai.claude-sonnet-4-5"]
@@ -72,7 +82,7 @@ class _Ctx:
         return self._client
 
 
-def _project(tmp_path: pathlib.Path, *, bind=True, tracing=True) -> pathlib.Path:
+def _project(tmp_path: pathlib.Path, *, bind=True, tracing=True, compound=False) -> pathlib.Path:
     project = tmp_path / "agent-langgraph"
     (project / "agent").mkdir(parents=True)
     write_project_metadata(project, framework="langgraph", template="agent-langgraph")
@@ -82,7 +92,10 @@ def _project(tmp_path: pathlib.Path, *, bind=True, tracing=True) -> pathlib.Path
         server="agentbricks",
         experiment_name="/Shared/agentbricks_traces/my-agent" if tracing else None,
     )
-    if bind:
+    if compound:
+        created.bind_model_service(ROUTER, "system.ai.claude-sonnet-4-5", role="router")
+        created.bind_model_service(WRITER, "system.ai.claude-sonnet-4-5", role="writer")
+    elif bind:
         created.bind_model_service(SERVICE, "system.ai.claude-sonnet-4-5")
     created.write()
     return project
@@ -105,37 +118,38 @@ def test_bind_writes_agent_toml_without_contacting_workspace(tmp_path, output):
     assert result.exit_code == 0, result.output
     if output == "json":
         assert json.loads(result.output) == {
+            "role": "agent",
             "model_service": SERVICE,
             "default": "system.ai.claude-sonnet-4-5",
             "manifest": str(project / "agent.toml"),
         }
-    reloaded = AgentProject.load(project)
-    assert reloaded.model_service == SERVICE
-    assert reloaded.model_service_default == "system.ai.claude-sonnet-4-5"
+    assert AgentProject.load(project).model_services == {
+        "agent": ModelServiceBinding(SERVICE, "system.ai.claude-sonnet-4-5")
+    }
 
 
 def test_bind_keeps_recorded_default_when_omitted(tmp_path):
     project = _project(tmp_path)
     result = _invoke(["bind", "main.my_agent.other", "--source", str(project)], _Ctx())
     assert result.exit_code == 0, result.output
-    reloaded = AgentProject.load(project)
-    assert reloaded.model_service == "main.my_agent.other"
-    assert reloaded.model_service_default == "system.ai.claude-sonnet-4-5"
+    assert AgentProject.load(project).model_services == {
+        "agent": ModelServiceBinding("main.my_agent.other", "system.ai.claude-sonnet-4-5")
+    }
 
 
 def test_bind_rejects_non_three_part_name(tmp_path):
     project = _project(tmp_path, bind=False)
     result = _invoke(["bind", "just-a-name", "--source", str(project)], _Ctx())
     assert result.exit_code != 0
-    assert AgentProject.load(project).model_service is None
+    assert AgentProject.load(project).model_services == {}
 
 
 def test_unbind_removes_the_table(tmp_path):
     project = _project(tmp_path)
     result = _invoke(["unbind", "--source", str(project)], _Ctx())
     assert result.exit_code == 0, result.output
-    assert AgentProject.load(project).model_service is None
-    assert "model_service" not in (project / "agent.toml").read_text()
+    assert AgentProject.load(project).model_services == {}
+    assert "model_services" not in (project / "agent.toml").read_text()
 
 
 # --- status / set / rollback --------------------------------------------------------
@@ -146,8 +160,9 @@ def test_status_reports_current_destination(tmp_path):
     result = _invoke(["status", "--source", str(project)], _Ctx(_FakeClient(), output="json"))
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["model_service"] == SERVICE
-    assert payload["model"] == "system.ai.claude-sonnet-4-5"
+    assert payload["model_services"] == {
+        "agent": {"model_service": SERVICE, "model": "system.ai.claude-sonnet-4-5"}
+    }
     assert payload["last_change"] is None
     assert payload["latest_run"] is None
 
@@ -217,17 +232,55 @@ def test_rollback_with_no_history_errors(tmp_path):
 # --- upgrade (job) / status / apply ------------------------------------------------------
 
 
-def _report(recommended: str) -> model_upgrade.UpgradeReport:
-    return model_upgrade.UpgradeReport(
-        service=SERVICE,
+# The SMU inputs every `models upgrade` call names (module:attr in the project).
+_EVAL_FLAGS = [
+    "--predict", "agent.eval:predict",
+    "--train-data", "agent.eval:TRAIN",
+    "--val-data", "agent.eval:VAL",
+    "--scorer", "agent.eval:SCORERS",
+]  # fmt: skip
+
+
+def _rec(service: str, recommended: str) -> model_upgrade.ServiceRecommendation:
+    return model_upgrade.ServiceRecommendation(
+        service=service,
         current_model="system.ai.claude-sonnet-4-5",
         recommended_model=recommended,
+        model_scores={"system.ai.claude-sonnet-4-5": 0.80, recommended: 0.82},
+    )
+
+
+def _report(recommended: str, **roles: str) -> model_upgrade.UpgradeReport:
+    """A finished run's report: ``recommended`` for the single `agent` role, or one per role."""
+    services = {"router": ROUTER, "writer": WRITER}
+    recommendations = (
+        {role: _rec(services[role], model) for role, model in roles.items()}
+        if roles
+        else {"agent": _rec(SERVICE, recommended)}
+    )
+    return model_upgrade.UpgradeReport(
+        recommendations=recommendations,
         baseline_score=0.80,
         best_score=0.82,
-        model_scores={"system.ai.claude-sonnet-4-5": 0.80, recommended: 0.82},
         train_records=7,
         val_records=3,
+        mlflow_run_id="r1",
     )
+
+
+@pytest.fixture
+def stub_promote(monkeypatch):
+    """Stand-in for promote_to_prod: switch each changed service on the fake client."""
+    promoted: list = []
+
+    def _promote(obj, report):
+        promoted.append(report)
+        for rec in report.recommendations.values():
+            if rec.changed:
+                obj.client().set_model_service_model(rec.service, rec.recommended_model)
+
+    monkeypatch.setattr("databricks_agentbricks.cli.models._promote", _promote)
+    return promoted
 
 
 class _JobClient(_FakeClient):
@@ -271,7 +324,8 @@ def test_upgrade_uploads_project_and_submits_job_without_switching(tmp_path, stu
     project = _project(tmp_path)
     client = _JobClient()
     result = _invoke(
-        ["upgrade", "-c", "claude-haiku-4-5,system.ai.gpt-5-4-mini", "--source", str(project)],
+        ["upgrade", *_EVAL_FLAGS, "-c", "claude-haiku-4-5,system.ai.gpt-5-4-mini",
+         "--source", str(project)],  # fmt: skip
         _Ctx(client, "json"),
     )
     assert result.exit_code == 0, result.output
@@ -284,9 +338,12 @@ def test_upgrade_uploads_project_and_submits_job_without_switching(tmp_path, stu
     assert sync_args[:3] == ["sync", str(project), ws_path]
     submitted_path, config, timeout_hours = stub_job["submit"]
     assert submitted_path == ws_path
-    assert config.service == SERVICE
-    assert config.framework == "langgraph"
-    assert config.candidates == ["system.ai.claude-haiku-4-5", "system.ai.gpt-5-4-mini"]
+    assert config.services == {"agent": SERVICE}
+    assert config.predict_fn == "agent.eval:predict"
+    assert (config.train_data, config.val_data) == ("agent.eval:TRAIN", "agent.eval:VAL")
+    assert config.scorers == ["agent.eval:SCORERS"]
+    assert config.prompt_uris == []
+    assert config.candidates == {"agent": ["system.ai.claude-haiku-4-5", "system.ai.gpt-5-4-mini"]}
     assert config.trace_experiment == "/Shared/agentbricks_traces/my-agent"
     assert config.weights == (0.7, 0.2, 0.1)
     assert timeout_hours == 6.0
@@ -296,16 +353,22 @@ def test_upgrade_uploads_project_and_submits_job_without_switching(tmp_path, stu
     assert run["run_id"] == 42 and run["upgrade_id"] == config.upgrade_id
 
 
-def test_status_then_apply_switches_to_finished_runs_recommendation(tmp_path, stub_job):
+def test_status_then_apply_switches_to_finished_runs_recommendation(
+    tmp_path, stub_job, stub_promote
+):
     project = _project(tmp_path)
-    _invoke(["upgrade", "-c", "claude-haiku-4-5", "--source", str(project)], _Ctx(_JobClient(), "json"))
+    _invoke(
+        ["upgrade", *_EVAL_FLAGS, "-c", "claude-haiku-4-5", "--source", str(project)],
+        _Ctx(_JobClient(), "json"),
+    )
 
     client = _JobClient(life_cycle="TERMINATED", result="SUCCESS")
     status = _invoke(["status", "--source", str(project)], _Ctx(client, "json"))
     assert status.exit_code == 0, status.output
     latest = json.loads(status.output)["latest_run"]
     assert latest["state"] == "SUCCESS"
-    assert latest["report"]["recommended_model"] == "system.ai.claude-haiku-4-5"
+    recommendation = latest["report"]["recommendations"]["agent"]
+    assert recommendation["recommended_model"] == "system.ai.claude-haiku-4-5"
 
     applied = _invoke(["apply", "--yes", "--source", str(project)], _Ctx(client, "json"))
     assert applied.exit_code == 0, applied.output
@@ -318,7 +381,10 @@ def test_status_then_apply_switches_to_finished_runs_recommendation(tmp_path, st
 
 def test_apply_before_the_run_finishes_refuses(tmp_path, stub_job):
     project = _project(tmp_path)
-    _invoke(["upgrade", "-c", "claude-haiku-4-5", "--source", str(project)], _Ctx(_JobClient(), "json"))
+    _invoke(
+        ["upgrade", *_EVAL_FLAGS, "-c", "claude-haiku-4-5", "--source", str(project)],
+        _Ctx(_JobClient(), "json"),
+    )
     client = _JobClient(life_cycle="RUNNING")
     result = _invoke(["apply", "--yes", "--source", str(project)], _Ctx(client))
     assert result.exit_code != 0
@@ -337,7 +403,8 @@ def test_upgrade_refuses_candidates_the_owner_cannot_execute(tmp_path, stub_job)
     project = _project(tmp_path)
     client = _JobClient(denied={"system.ai.gpt-5-4-mini"})
     result = _invoke(
-        ["upgrade", "-c", "claude-haiku-4-5,gpt-5-4-mini", "--source", str(project)], _Ctx(client)
+        ["upgrade", *_EVAL_FLAGS, "-c", "claude-haiku-4-5,gpt-5-4-mini", "--source", str(project)],  # fmt: skip
+        _Ctx(client)
     )
     assert result.exit_code != 0
     assert "gpt-5-4-mini" in result.output
@@ -347,7 +414,8 @@ def test_upgrade_refuses_candidates_the_owner_cannot_execute(tmp_path, stub_job)
 def test_upgrade_requires_tracing(tmp_path, stub_job):
     project = _project(tmp_path, tracing=False)
     result = _invoke(
-        ["upgrade", "-c", "claude-haiku-4-5", "--source", str(project)], _Ctx(_JobClient())
+        ["upgrade", *_EVAL_FLAGS, "-c", "claude-haiku-4-5", "--source", str(project)],  # fmt: skip
+        _Ctx(_JobClient())
     )
     assert result.exit_code != 0
     assert "tracing" in result.output
@@ -357,7 +425,8 @@ def test_upgrade_requires_tracing(tmp_path, stub_job):
 def test_upgrade_rejects_bad_weights(tmp_path, stub_job):
     project = _project(tmp_path)
     result = _invoke(
-        ["upgrade", "-c", "claude-haiku-4-5", "--weights", "0.5,0.5,0.5", "--source", str(project)],
+        ["upgrade", *_EVAL_FLAGS, "-c", "claude-haiku-4-5", "--weights", "0.5,0.5,0.5",
+         "--source", str(project)],  # fmt: skip
         _Ctx(_JobClient()),
     )
     assert result.exit_code != 0
@@ -368,3 +437,161 @@ def test_list_shows_chat_models(tmp_path):
     result = _invoke(["list"], _Ctx(_FakeClient(), "json"))
     assert result.exit_code == 0, result.output
     assert json.loads(result.output) == ["system.ai.claude-haiku-4-5", "system.ai.claude-sonnet-4-5"]
+
+
+def test_upgrade_passes_prompt_uris_to_the_job(tmp_path, stub_job):
+    project = _project(tmp_path)
+    result = _invoke(
+        ["upgrade", *_EVAL_FLAGS, "-c", "claude-haiku-4-5",
+         "--prompt", "prompts:/main.my_agent.system@production", "--source", str(project)],
+        _Ctx(_JobClient(), "json"),
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+    _, config, _ = stub_job["submit"]
+    assert config.prompt_uris == ["prompts:/main.my_agent.system@production"]
+
+
+def test_upgrade_rejects_a_prompt_that_is_not_a_uri(tmp_path, stub_job):
+    project = _project(tmp_path)
+    result = _invoke(
+        ["upgrade", *_EVAL_FLAGS, "-c", "claude-haiku-4-5", "--prompt", "main.my_agent.system",
+         "--source", str(project)],
+        _Ctx(_JobClient()),
+    )  # fmt: skip
+    assert result.exit_code != 0
+    assert "submit" not in stub_job
+
+
+def test_apply_with_rewritten_prompts_promotes_through_promote_to_prod(
+    tmp_path, stub_job, stub_promote, monkeypatch
+):
+    report = _report("system.ai.claude-haiku-4-5")
+    report.prompt_changes = ["main.my_agent.system"]
+    monkeypatch.setattr(model_upgrade, "fetch_report", lambda *args: report)
+    project = _project(tmp_path)
+    client = _JobClient(life_cycle="TERMINATED", result="SUCCESS")
+    _invoke(
+        ["upgrade", *_EVAL_FLAGS, "-c", "claude-haiku-4-5", "--source", str(project)],
+        _Ctx(client, "json"),
+    )
+    result = _invoke(["apply", "--yes", "--source", str(project)], _Ctx(client, "json"))
+    assert result.exit_code == 0, result.output
+    assert stub_promote == [report]
+    assert json.loads(result.output)["prompts"] == ["main.my_agent.system"]
+    (change,) = model_upgrade.read_history(project)["changes"]
+    assert change["model"] == "system.ai.claude-haiku-4-5"
+
+
+# --- compound agents: one model service per LLM call site ------------------------------------
+
+
+def test_bind_two_roles_writes_one_table_each(tmp_path):
+    project = _project(tmp_path, bind=False)
+    for service, role in ((ROUTER, "router"), (WRITER, "writer")):
+        result = _invoke(
+            ["bind", service, "--role", role, "--default", "claude-sonnet-4-5",
+             "--source", str(project)],
+            _Ctx(),
+        )  # fmt: skip
+        assert result.exit_code == 0, result.output
+    assert AgentProject.load(project).model_services == {
+        "router": ModelServiceBinding(ROUTER, "system.ai.claude-sonnet-4-5"),
+        "writer": ModelServiceBinding(WRITER, "system.ai.claude-sonnet-4-5"),
+    }
+    text = (project / "agent.toml").read_text()
+    assert "[model_services.router]" in text and "[model_services.writer]" in text
+
+
+def test_status_lists_every_role(tmp_path):
+    project = _project(tmp_path, compound=True)
+    result = _invoke(["status", "--source", str(project)], _Ctx(_FakeClient(), "json"))
+    assert result.exit_code == 0, result.output
+    assert set(json.loads(result.output)["model_services"]) == {"router", "writer"}
+
+
+def test_upgrade_takes_candidates_per_role(tmp_path, stub_job):
+    project = _project(tmp_path, compound=True)
+    result = _invoke(
+        ["upgrade", *_EVAL_FLAGS, "-c", "router=claude-haiku-4-5,gpt-5-4-nano",
+         "-c", "writer=claude-haiku-4-5", "--source", str(project)],
+        _Ctx(_JobClient(), "json"),
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+    _, config, _ = stub_job["submit"]
+    assert config.services == {"router": ROUTER, "writer": WRITER}
+    assert config.candidates == {
+        "router": ["system.ai.claude-haiku-4-5", "system.ai.gpt-5-4-nano"],
+        "writer": ["system.ai.claude-haiku-4-5"],
+    }
+
+
+def test_upgrade_needs_role_prefixes_when_several_roles_are_bound(tmp_path, stub_job):
+    project = _project(tmp_path, compound=True)
+    result = _invoke(
+        ["upgrade", *_EVAL_FLAGS, "-c", "claude-haiku-4-5", "--source", str(project)],  # fmt: skip
+        _Ctx(_JobClient())
+    )
+    assert result.exit_code != 0
+    assert "router=claude-haiku-4-5" in result.output
+    assert "submit" not in stub_job
+
+
+def test_upgrade_rejects_an_unbound_role(tmp_path, stub_job):
+    project = _project(tmp_path, compound=True)
+    result = _invoke(
+        ["upgrade", *_EVAL_FLAGS, "-c", "critic=claude-haiku-4-5", "--source", str(project)],
+        _Ctx(_JobClient()),
+    )
+    assert result.exit_code != 0
+    assert "isn't a bound role" in result.output
+
+
+def test_set_needs_a_role_when_several_are_bound(tmp_path):
+    project = _project(tmp_path, compound=True)
+    client = _FakeClient()
+    result = _invoke(["set", "claude-haiku-4-5", "--yes", "--source", str(project)], _Ctx(client))
+    assert result.exit_code != 0
+    assert "--role" in result.output
+    result = _invoke(
+        ["set", "claude-haiku-4-5", "--role", "router", "--yes", "--source", str(project)],  # fmt: skip
+        _Ctx(client)
+    )
+    assert result.exit_code == 0, result.output
+    assert client.models == {ROUTER: "system.ai.claude-haiku-4-5"}
+
+
+def test_apply_switches_every_changed_role_and_records_each(
+    tmp_path, stub_job, stub_promote, monkeypatch
+):
+    report = _report("", router="system.ai.claude-haiku-4-5", writer="system.ai.claude-sonnet-4-5")
+    monkeypatch.setattr(model_upgrade, "fetch_report", lambda *args: report)
+    project = _project(tmp_path, compound=True)
+    client = _JobClient(life_cycle="TERMINATED", result="SUCCESS")
+    _invoke(
+        ["upgrade", *_EVAL_FLAGS, "-c", "router=claude-haiku-4-5", "--source", str(project)],
+        _Ctx(client, "json"),
+    )
+    result = _invoke(["apply", "--yes", "--source", str(project)], _Ctx(client, "json"))
+    assert result.exit_code == 0, result.output
+    assert set(json.loads(result.output)["models"]) == {"router"}  # writer kept its model
+    assert client.models == {ROUTER: "system.ai.claude-haiku-4-5"}
+    (change,) = model_upgrade.read_history(project)["changes"]
+    assert change["model_service"] == ROUTER
+
+
+def test_apply_refuses_when_a_service_moved_since_the_run(
+    tmp_path, stub_job, stub_promote, monkeypatch
+):
+    report = _report("system.ai.claude-haiku-4-5")
+    monkeypatch.setattr(model_upgrade, "fetch_report", lambda *args: report)
+    project = _project(tmp_path)
+    client = _JobClient(life_cycle="TERMINATED", result="SUCCESS")
+    _invoke(
+        ["upgrade", *_EVAL_FLAGS, "-c", "claude-haiku-4-5", "--source", str(project)],
+        _Ctx(client, "json"),
+    )
+    client.models[SERVICE] = "system.ai.gpt-5-4-mini"  # someone ran `models set` meanwhile
+    result = _invoke(["apply", "--yes", "--source", str(project)], _Ctx(client))
+    assert result.exit_code != 0
+    assert "switched models after" in result.output
+    assert stub_promote == []

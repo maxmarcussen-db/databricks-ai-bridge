@@ -18,9 +18,16 @@ except ModuleNotFoundError:
 # names live in `agent_project`, next to the manifest parsing that reads them.)
 MEMORY_STORE_ENV = "AGENT_MEMORY_STORE"
 SESSION_STORE_ENV = "AGENT_SESSION_STORE"
-# The UC model service (catalog.schema.name) the agent calls through the AI Gateway, written by
-# `agentbricks deploy` from agent.toml's [model_service] binding.
-MODEL_SERVICE_ENV = "AGENT_MODEL_SERVICE"
+# The UC model service (catalog.schema.name) each LLM call site goes through the AI Gateway, one env
+# var per role (`AGENT_MODEL_SERVICE_<ROLE>`), written by `agentbricks deploy` from agent.toml's
+# [model_services.<role>] bindings. A single-model agent uses DEFAULT_MODEL_ROLE.
+MODEL_SERVICE_ENV_PREFIX = "AGENT_MODEL_SERVICE_"
+DEFAULT_MODEL_ROLE = "agent"
+
+
+def model_service_env(role: str = DEFAULT_MODEL_ROLE) -> str:
+    """The env var carrying ``role``'s model service name, e.g. ``AGENT_MODEL_SERVICE_ROUTER``."""
+    return f"{MODEL_SERVICE_ENV_PREFIX}{role.upper()}"
 
 
 class ToolManifestError(RuntimeError):
@@ -219,14 +226,17 @@ def resolve_session_store(explicit: str | None = None) -> str | None:
     return explicit or os.getenv(SESSION_STORE_ENV) or None
 
 
-def resolve_model_service(explicit: str | None = None) -> str | None:
-    """The model service name: ``explicit`` arg → ``AGENT_MODEL_SERVICE`` env → None.
+def resolve_model_service(
+    role: str = DEFAULT_MODEL_ROLE, explicit: str | None = None
+) -> str | None:
+    """``role``'s model service: ``explicit`` arg → ``AGENT_MODEL_SERVICE_<ROLE>`` env → None.
 
-    None means "no bound model service": the agent falls back to its own default model. A bound
+    None means "no bound model service": that call site falls back to its own default model. A bound
     service is a user-owned UC model service whose destination `agentbricks models` can repoint,
-    so upgrading the model needs no code change or redeploy.
+    so upgrading the model needs no code change or redeploy. A compound agent resolves one per call
+    site, e.g. ``resolve_model_service("router")`` and ``resolve_model_service("writer")``.
     """
-    return explicit or os.getenv(MODEL_SERVICE_ENV) or None
+    return explicit or os.getenv(model_service_env(role)) or None
 
 
 def downscope_wire(tool: ToolRecord) -> dict[str, list[dict[str, str]]]:

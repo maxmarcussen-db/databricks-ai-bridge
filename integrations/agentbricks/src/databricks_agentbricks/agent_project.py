@@ -31,11 +31,15 @@ SESSION_STORE_TABLE = "session_store"
 # init` bootstraps a default name.
 TRACING_TABLE = "tracing"
 EXPERIMENT_NAME_KEY = "experiment_name"
-# The model-service binding (`agentbricks models bind`): `name` is the user-owned UC model service the
-# agent calls (catalog.schema.name); `default` is the system.ai.* model deploy routes it to when it
-# first creates the service. `agentbricks models upgrade` / `set` repoint it afterwards.
-MODEL_SERVICE_TABLE = "model_service"
+# The model-service bindings (`agentbricks models bind`), one `[model_services.<role>]` table per
+# LLM call site: `name` is the user-owned UC model service that call goes through
+# (catalog.schema.name); `default` is the system.ai.* model deploy routes it to when it first
+# creates the service. `agentbricks models upgrade` / `set` repoint them afterwards. A single-model
+# agent uses one role, DEFAULT_MODEL_ROLE.
+MODEL_SERVICES_TABLE = "model_services"
 MODEL_SERVICE_DEFAULT_KEY = "default"
+DEFAULT_MODEL_ROLE = tool_manifest.DEFAULT_MODEL_ROLE
+_ROLE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
 _SCHEMA_VERSION = 1
 _SUPPORTED_SCOPE_KINDS = {"table", "volume", "workspace"}
@@ -55,6 +59,24 @@ def _three_part_name(value: str, description: str) -> str:
             hint=f"Use a three-part name: catalog.schema.{description.replace(' ', '_')}.",
         )
     return value
+
+
+def model_role(value: str) -> str:
+    """Validate a model-service role name (lowercase identifier, e.g. ``router``)."""
+    if not isinstance(value, str) or not _ROLE_PATTERN.match(value):
+        raise AgentCliError(
+            f"Invalid model role {value!r}.",
+            hint="Use a lowercase identifier such as `router` or `writer`.",
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class ModelServiceBinding:
+    """One `[model_services.<role>]` table: a call site's service and its first-deploy model."""
+
+    name: str
+    default: str | None = None
 
 
 @dataclass(frozen=True)
@@ -275,6 +297,30 @@ def _store_name_from_manifest(value: object, table: str) -> str | None:
     return _required_string(cast(Mapping[str, Any], value).get("name"), f"[{table}] name")
 
 
+def _model_services_from_manifest(value: object) -> dict[str, ModelServiceBinding]:
+    """Read the ``[model_services.<role>]`` tables, or {} if there are none."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise AgentCliError(f"agent.toml [{MODEL_SERVICES_TABLE}] must be a table of roles.")
+    bindings: dict[str, ModelServiceBinding] = {}
+    for role, table in cast(Mapping[str, Any], value).items():
+        model_role(role)
+        where = f"[{MODEL_SERVICES_TABLE}.{role}]"
+        if not isinstance(table, Mapping):
+            raise AgentCliError(f"agent.toml {where} must be a table.")
+        name = _three_part_name(
+            _required_string(table.get("name"), f"{where} name"), "model service"
+        )
+        default = table.get(MODEL_SERVICE_DEFAULT_KEY)
+        if default is not None and not (isinstance(default, str) and default):
+            raise AgentCliError(
+                f"agent.toml {where} {MODEL_SERVICE_DEFAULT_KEY} must be a non-empty string."
+            )
+        bindings[role] = ModelServiceBinding(name, default or None)
+    return bindings
+
+
 def _store_id_from_manifest(value: object) -> str | None:
     """Read the optional bare store ``id`` from a ``[memory_store]`` table, or None if absent."""
     if not isinstance(value, Mapping):
@@ -390,8 +436,7 @@ class AgentProject:
         memory_store_id: str | None = None,
         deployment_name: str | None = None,
         trace_experiment_name: str | None = None,
-        model_service: str | None = None,
-        model_service_default: str | None = None,
+        model_services: dict[str, ModelServiceBinding] | None = None,
     ) -> None:
         self.root = root
         self.path = root / "agent.toml"
@@ -413,10 +458,10 @@ class AgentProject:
         # unbound, i.e. off. Storing a name (not an id) keeps the binding valid across workspaces and
         # profiles, since an id is workspace-local. `agentbricks init` bootstraps a default name.
         self.trace_experiment_name = trace_experiment_name
-        # Model-service binding: the UC model service the agent calls, and the model deploy routes it
-        # to on first create. None = unbound (the agent calls its template default model directly).
-        self.model_service = model_service
-        self.model_service_default = model_service_default
+        # Model-service bindings by role: the UC model service each LLM call site goes through, and
+        # the model deploy routes it to on first create. Empty = unbound (the agent calls its own
+        # default models directly).
+        self.model_services: dict[str, ModelServiceBinding] = dict(model_services or {})
 
     @classmethod
     def load(cls, root: pathlib.Path | str | None = None) -> "AgentProject":
@@ -475,21 +520,7 @@ class AgentProject:
             trace_experiment_name = (
                 str(raw_experiment) if isinstance(raw_experiment, str) and raw_experiment else None
             )
-        model_service = _store_name_from_manifest(
-            document.get(MODEL_SERVICE_TABLE), MODEL_SERVICE_TABLE
-        )
-        if model_service is not None:
-            _three_part_name(model_service, "model service")
-        model_service_default: str | None = None
-        model_table = document.get(MODEL_SERVICE_TABLE)
-        if isinstance(model_table, Mapping):
-            raw_default = model_table.get(MODEL_SERVICE_DEFAULT_KEY)
-            if raw_default is not None and not (isinstance(raw_default, str) and raw_default):
-                raise AgentCliError(
-                    f"agent.toml [{MODEL_SERVICE_TABLE}] {MODEL_SERVICE_DEFAULT_KEY} must be a "
-                    "non-empty string."
-                )
-            model_service_default = str(raw_default) if raw_default else None
+        model_services = _model_services_from_manifest(document.get(MODEL_SERVICES_TABLE))
         return cls(
             project_root,
             document,
@@ -501,8 +532,7 @@ class AgentProject:
             memory_store_id,
             str(deployment_name) if deployment_name is not None else None,
             trace_experiment_name,
-            str(model_service) if model_service else None,
-            model_service_default,
+            model_services,
         )
 
     @classmethod
@@ -612,38 +642,57 @@ class AgentProject:
         """Remove the session store binding from agent.toml. Returns True if it was present."""
         return self._clear_store(SESSION_STORE_TABLE)
 
-    def bind_model_service(self, name: str, default: str | None = None) -> bool:
-        """Declare the model-service binding in agent.toml. Returns True if it changed.
+    def bind_model_service(
+        self, name: str, default: str | None = None, role: str = DEFAULT_MODEL_ROLE
+    ) -> bool:
+        """Declare the model service for ``role`` in agent.toml. Returns True if it changed.
 
         ``name`` is a three-part UC name (catalog.schema.name). ``default`` is the ``system.ai.*``
         model `agentbricks deploy` routes the service to when it creates it; an existing service is never
         repointed by deploy. Passing no ``default`` keeps any recorded one.
         """
-        name = _three_part_name(_required_string(name, f"[{MODEL_SERVICE_TABLE}] name"), "model service")
-        default = default or self.model_service_default
-        if self.model_service == name and self.model_service_default == default:
+        role = model_role(role)
+        name = _three_part_name(
+            _required_string(name, f"[{MODEL_SERVICES_TABLE}.{role}] name"), "model service"
+        )
+        for other_role, binding in self.model_services.items():
+            if other_role != role and binding.name == name:
+                raise AgentCliError(
+                    f"Model service '{name}' is already bound to role '{other_role}'.",
+                    hint="Give each LLM call site its own model service so each can be upgraded "
+                    "on its own.",
+                )
+        current = self.model_services.get(role)
+        default = default or (current.default if current else None)
+        binding = ModelServiceBinding(name, default)
+        if current == binding:
             return False
-        table = self._document.get(MODEL_SERVICE_TABLE)
+        tables = self._document.get(MODEL_SERVICES_TABLE)
+        if not isinstance(tables, Mapping):
+            tables = tomlkit.table()
+            self._document.append(MODEL_SERVICES_TABLE, tables)
+        table = tables.get(role)
         if not isinstance(table, Mapping):
             table = tomlkit.table()
-            self._document.append(MODEL_SERVICE_TABLE, table)
+            tables.append(role, table)
         table["name"] = name
         if default:
             table[MODEL_SERVICE_DEFAULT_KEY] = default
         elif MODEL_SERVICE_DEFAULT_KEY in table:
             del table[MODEL_SERVICE_DEFAULT_KEY]
-        self.model_service = name
-        self.model_service_default = default
+        self.model_services[role] = binding
         return True
 
-    def unbind_model_service(self) -> bool:
-        """Remove the model-service binding from agent.toml. Returns True if it was present."""
-        if self.model_service is None:
+    def unbind_model_service(self, role: str = DEFAULT_MODEL_ROLE) -> bool:
+        """Remove ``role``'s model-service binding from agent.toml. True if it was present."""
+        if role not in self.model_services:
             return False
-        if MODEL_SERVICE_TABLE in self._document:
-            del self._document[MODEL_SERVICE_TABLE]
-        self.model_service = None
-        self.model_service_default = None
+        tables = self._document.get(MODEL_SERVICES_TABLE)
+        if isinstance(tables, Mapping) and role in tables:
+            del tables[role]
+            if not tables:
+                del self._document[MODEL_SERVICES_TABLE]
+        del self.model_services[role]
         return True
 
     def bind_tracing(self, experiment_name: str) -> bool:

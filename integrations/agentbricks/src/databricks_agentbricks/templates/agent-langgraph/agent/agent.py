@@ -31,8 +31,9 @@ from databricks_agentkit.runtime.tool_manifest import resolve_model_service
 # A Unity Catalog AI Gateway model service, served from the `system.ai` schema and queried through
 # the gateway (see `use_ai_gateway=True` below). Swap for any `system.ai.*` model service your
 # workspace exposes — the demo chat app's picker lists what's available.
-# `agentbricks models bind` swaps this for a model service you own (wired in as AGENT_MODEL_SERVICE by
-# `agentbricks deploy`), so `agentbricks models upgrade` can change the model without a code change.
+# `agentbricks models bind` swaps this for a model service you own (wired in by `agentbricks deploy`
+# as AGENT_MODEL_SERVICE_AGENT), so `agentbricks models upgrade` can change the model without a code
+# change.
 MODEL = resolve_model_service() or "system.ai.claude-sonnet-4-5"
 
 # Tools that require human approval before they run. Map a tool name to True to allow every decision

@@ -1062,22 +1062,34 @@ _Options_
 
 ### `agentbricks models`
 
-Choose, evaluate, and upgrade the model behind your agent. The agent calls a Unity Catalog AI Gateway model service you own (`catalog.schema.name`, declared under `[model_service]` in agent.toml) instead of a hardcoded `system.ai.*` model. `agentbricks deploy` creates the service if it's missing (routed to the binding's default model), grants the app's service principal EXECUTE on it, and wires it in as `AGENT_MODEL_SERVICE`. After that, switching the model behind the service takes effect without a code change or redeploy. Upgrade runs and switches are recorded in `.agentbricks/model_upgrades.json`; switches can be rolled back.
+Choose, evaluate, and upgrade the models behind your agent. Each LLM call site in the agent (a *role*: for example `router` and `writer` in a compound agent, or the single `agent` role in a one-model agent) calls a Unity Catalog AI Gateway model service you own (`catalog.schema.name`, declared under `[model_services.<role>]` in agent.toml) instead of a hardcoded `system.ai.*` model:
+
+```toml
+[model_services.router]
+name = "main.my_agent.router_llm"
+default = "system.ai.claude-haiku-4-5"
+
+[model_services.writer]
+name = "main.my_agent.writer_llm"
+default = "system.ai.claude-sonnet-4-5"
+```
+
+`agentbricks deploy` creates each service if it's missing (routed to its binding's default model), grants the app's service principal EXECUTE on it, and wires it in as `AGENT_MODEL_SERVICE_<ROLE>`; the agent reads it with `resolve_model_service("<role>")`. After that, switching the model behind a service takes effect without a code change or redeploy, and `models upgrade` searches every role's model, plus any prompts you name, together. Upgrade runs and switches are recorded in `.agentbricks/model_upgrades.json`; switches can be rolled back.
 
 | Subcommand | Description |
 | --- | --- |
-| [`models bind`](#agentbricks-models-bind) | Declare the agent's model service in agent.toml (creates nothing; deploy provisions it). |
-| [`models unbind`](#agentbricks-models-unbind) | Remove the model-service binding from agent.toml (the service is left in place). |
+| [`models bind`](#agentbricks-models-bind) | Declare the model service for one of the agent's LLM calls in agent.toml (creates nothing; deploy provisions it). |
+| [`models unbind`](#agentbricks-models-unbind) | Remove a model-service binding from agent.toml (the service is left in place). |
 | [`models list`](#agentbricks-models-list) | List the `system.ai.*` chat models you can route the agent to. |
-| [`models status`](#agentbricks-models-status) | Show the bound model service, the model behind it now, and the latest upgrade run with its recommendation. |
-| [`models set`](#agentbricks-models-set) | Switch the model service to a named model. |
-| [`models rollback`](#agentbricks-models-rollback) | Switch back to the model used before the last switch. |
-| [`models upgrade`](#agentbricks-models-upgrade) | Evaluate candidate models on the agent's own traces, as a Databricks job. |
-| [`models apply`](#agentbricks-models-apply) | Switch to the latest finished upgrade run's recommendation. |
+| [`models status`](#agentbricks-models-status) | Show each bound model service, the model behind it now, and the latest upgrade run with its recommendation. |
+| [`models set`](#agentbricks-models-set) | Switch one model service to a named model. |
+| [`models rollback`](#agentbricks-models-rollback) | Switch one model service back to the model it used before its last switch. |
+| [`models upgrade`](#agentbricks-models-upgrade) | Search models for every role, and optionally rewritten prompts, together, as a Databricks job. |
+| [`models apply`](#agentbricks-models-apply) | Apply the latest finished upgrade run's recommendation: every model and prompt it changed. |
 
 #### `agentbricks models bind`
 
-Bind model service SERVICE to the agent by declaring it in agent.toml. This only edits agent.toml; `agentbricks deploy` creates the service if it doesn't exist, routed to `--default`. Deploy never repoints an existing service, so a redeploy can't undo an upgrade.
+Bind model service SERVICE to one of the agent's LLM calls by declaring it in agent.toml. Bind one service per call site in a compound agent, each under its own `--role`. This only edits agent.toml; `agentbricks deploy` creates the service if it doesn't exist, routed to `--default`. Deploy never repoints an existing service, so a redeploy can't undo an upgrade.
 
 ```
 agentbricks models bind SERVICE [options]
@@ -1093,12 +1105,13 @@ _Options_
 
 | Option | Values | Default | Required | Description |
 | --- | --- | --- | --- | --- |
+| `--role <ROLE>` | string | `agent` | no | Name for the LLM call site this service backs (lowercase identifier, e.g. `router`). |
 | `--default <MODEL>` | string | - | no | `system.ai.*` model deploy routes the service to when it creates it (the `system.ai.` prefix is optional). Omit to keep a recorded default. |
 | `--source <SOURCE>` | path | `.` | no | Agent Bricks project containing agent.toml. |
 
 #### `agentbricks models unbind`
 
-Remove the model-service binding from agent.toml. After the next deploy the agent calls its template default model directly again.
+Remove a model-service binding from agent.toml. After the next deploy that LLM call uses its own default model directly again.
 
 ```
 agentbricks models unbind [options]
@@ -1108,6 +1121,7 @@ _Options_
 
 | Option | Values | Default | Required | Description |
 | --- | --- | --- | --- | --- |
+| `--role <ROLE>` | string | only bound role | no | Which bound LLM call site. Required when more than one role is bound. |
 | `--source <SOURCE>` | path | `.` | no | Agent Bricks project containing agent.toml. |
 
 #### `agentbricks models list`
@@ -1120,7 +1134,7 @@ agentbricks models list
 
 #### `agentbricks models status`
 
-Show the bound model service, the model it routes to now, its last recorded switch, and the latest upgrade run: the job's state and, once it has finished, its per-model scores and recommendation.
+Show each bound model service and the model it routes to now, the last recorded switch, and the latest upgrade run: the job's state and, once it has finished, each role's per-model scores and recommendation.
 
 ```
 agentbricks models status [options]
@@ -1134,7 +1148,7 @@ _Options_
 
 #### `agentbricks models set`
 
-Switch the bound model service to MODEL. Prompts for confirmation; `-o json` switches only with `--yes`.
+Switch one bound model service to MODEL. Prompts for confirmation; `-o json` switches only with `--yes`.
 
 ```
 agentbricks models set MODEL [options]
@@ -1150,12 +1164,13 @@ _Options_
 
 | Option | Values | Default | Required | Description |
 | --- | --- | --- | --- | --- |
+| `--role <ROLE>` | string | only bound role | no | Which bound LLM call site. Required when more than one role is bound. |
 | `--yes` (`-y`) | flag | - | no | Switch without asking for confirmation. |
 | `--source <SOURCE>` | path | `.` | no | Agent Bricks project containing agent.toml. |
 
 #### `agentbricks models rollback`
 
-Switch the model service back to the model it used before its last recorded switch.
+Switch one model service back to the model it used before its last recorded switch.
 
 ```
 agentbricks models rollback [options]
@@ -1165,29 +1180,33 @@ _Options_
 
 | Option | Values | Default | Required | Description |
 | --- | --- | --- | --- | --- |
+| `--role <ROLE>` | string | only bound role | no | Which bound LLM call site. Required when more than one role is bound. |
 | `--yes` (`-y`) | flag | - | no | Switch without asking for confirmation. |
 | `--source <SOURCE>` | path | `.` | no | Agent Bricks project containing agent.toml. |
 
 #### `agentbricks models upgrade`
 
-Evaluate candidate models on the agent's own traces, as a serverless Databricks job. The search never runs on your machine (it can take hours), so this command uploads the project to `/Workspace/Users/<you>/agentbricks_model_upgrades/<name>` (its own folder, separate from the deployed app's source), submits a one-time run, and returns. The job's environment installs the uploaded project from its `pyproject.toml` plus `databricks-agentbricks[upgrade]`.
+Search candidate models for every bound role together, and with `--prompt` rewritten versions of the agent's MLflow Prompt Registry prompts, as a serverless Databricks job. Every combination is scored on the whole agent, so a cheaper router that hurts the writer's answers loses. The search never runs on your machine (it can take hours), so this command uploads the project to `/Workspace/Users/<you>/agentbricks_model_upgrades/<name>` (its own folder, separate from the deployed app's source), submits a one-time run, and returns. The job's environment installs the uploaded project from its `pyproject.toml` plus `databricks-agentbricks[upgrade]`.
 
-The job reads the agent's recent successful traces from its bound trace experiment, replays each request through the project's agent code once per candidate against a temporary `<service>_exp` copy of the model service (production traffic is untouched), and scores each answer against what production returned with an LLM judge. The winner balances quality, latency, and cost (`--weights`); at equal quality the cheaper model wins. The current model is always the baseline. The run logs to the MLflow experiment `<trace experiment>-model-upgrades`, never to the agent's own trace experiment.
+The job imports the `predict_fn`, eval data, and scorers you name from the project (`module:attr` references, the same inputs `optimize_prompts_and_models` takes) and runs the whole agent on each eval record per candidate combination, against temporary `<service>_exp` copies of the model services (production traffic is untouched). It sets each `AGENT_MODEL_SERVICE_<ROLE>` before importing your code, so every LLM call that uses `resolve_model_service("<role>")` hits its copy. The winner balances quality, latency, and cost (`--weights`); at equal quality the cheaper models win. The run logs to the MLflow experiment `<trace experiment>-model-upgrades`, never to the agent's own trace experiment.
 
 Nothing changes until you run `agentbricks models apply`. Check on the job with `agentbricks models status`.
 
 ```
-agentbricks models upgrade --candidates MODEL [options]
+agentbricks models upgrade --candidates MODEL --predict REF --train-data REF --val-data REF --scorer REF [options]
 ```
 
 _Options_
 
 | Option | Values | Default | Required | Description |
 | --- | --- | --- | --- | --- |
-| `--candidates <MODEL>` (`-c`) | string | - | yes | `system.ai.*` model to evaluate. Repeat, or comma-separate. |
-| `--traces <N>` | integer >= 5 | `50` | no | Recent traces to build the eval set from (about 30% are held out for validation). |
+| `--candidates <ROLE=MODEL,...>` (`-c`) | string | - | yes | `system.ai.*` models to evaluate for one role, e.g. `router=claude-haiku-4-5,gpt-5-4-nano`. Repeat per role; the `ROLE=` prefix is optional when only one role is bound. Roles you don't list keep their current model. Each role's current model is always its baseline. |
+| `--prompt <URI>` | `prompts:/` URI | - | no | Prompt Registry prompt to optimize alongside the model (e.g. `prompts:/main.my_agent.system@production`). Repeat for more. The agent must load it with `load_prompt` and call `.format()` on every call. |
+| `--predict <REF>` | `module:attr` | - | yes | Your agent's `predict_fn`: a sync callable taking one eval record's `inputs` dict. |
+| `--train-data <REF>` | `module:attr` | - | yes | Training records: a list of `{"inputs": ..., "expectations": ...}`. |
+| `--val-data <REF>` | `module:attr` | - | yes | Validation records, same shape as `--train-data`. |
+| `--scorer <REF>` | `module:attr` | - | yes | A scorer or list of scorers (MLflow scorers, or `(inputs, expectations, answer) -> float`). Repeat for more. |
 | `--budget <N>` | integer >= 1 | 4 x eval records | no | Evaluation budget, in agent runs. |
-| `--judge-model <ENDPOINT>` | string | `databricks-claude-sonnet-4-6` | no | Model serving endpoint for the equivalence judge. |
 | `--weights <Q,L,C>` | string | `0.7,0.2,0.1` | no | Quality, latency, cost weights; non-negative, summing to 1. |
 | `--timeout-hours <H>` | number >= 0.1 | `6` | no | Cancel the job if it runs longer than this. |
 | `--wait` | flag | - | no | Wait for the job to finish and show its recommendation (Ctrl-C detaches; the job keeps running). |
@@ -1195,7 +1214,7 @@ _Options_
 
 #### `agentbricks models apply`
 
-Switch the model service to the latest finished upgrade run's recommendation. Errors if the run hasn't finished. Prompts for confirmation; `-o json` switches only with `--yes`.
+Apply the latest finished upgrade run's recommendation with the optimizer's `promote_to_prod`: it repoints every model service whose model changed and registers each rewritten prompt as a new version (its alias moves there; the prior version keeps `@production_previous`), rolling all of it back if any step fails. Needs the `upgrade` extra installed locally. Errors if the run hasn't finished, or if a service was switched after the run started. Prompts for confirmation; `-o json` switches only with `--yes`.
 
 ```
 agentbricks models apply [options]

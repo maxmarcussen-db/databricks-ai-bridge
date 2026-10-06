@@ -427,22 +427,31 @@ Memory and session stores are independent resources: deleting one never affects 
 
 ## Model upgrades
 
-Point the agent at a Unity Catalog AI Gateway model service you own, and the model behind it can
-change without a code change or redeploy:
+Point each of the agent's LLM calls at a Unity Catalog AI Gateway model service you own, and the
+models behind them can change without a code change or redeploy. A one-model agent binds one service;
+a compound agent binds one per call site, each under a role:
 
 ```sh
-agentbricks models bind main.my_agent.llm --default system.ai.claude-sonnet-4-5
-agentbricks deploy my-agent      # creates the service and grants the app EXECUTE on it
-agentbricks models upgrade -c system.ai.claude-haiku-4-5 -c system.ai.gpt-5-4-mini
+agentbricks models bind main.my_agent.router_llm --role router --default system.ai.claude-haiku-4-5
+agentbricks models bind main.my_agent.writer_llm --role writer --default system.ai.claude-sonnet-4-5
+agentbricks deploy my-agent      # creates the services and grants the app EXECUTE on them
+agentbricks models upgrade -c router=claude-haiku-4-5,gpt-5-4-nano -c writer=claude-haiku-4-5 \
+  --prompt prompts:/main.my_agent.writer@production \
+  --predict agent.eval:predict --train-data agent.eval:TRAIN --val-data agent.eval:VAL \
+  --scorer agent.eval:SCORERS
 agentbricks models status        # the job's state, then its recommendation
 agentbricks models apply         # switch to it
 ```
 
 `models upgrade` uploads the project to your workspace and runs the search as a serverless
-Databricks job (it can take hours, so it never runs locally). The job replays the deployed agent's
-recent traces through your agent code once per candidate, against a temporary `<service>_exp`
-clone, and scores each answer against production's with an LLM judge. `models apply` switches to
-the best quality / latency / cost trade-off; `models rollback` undoes the last switch.
+Databricks job (it can take hours, so it never runs locally). The job imports the `predict_fn`,
+eval data, and scorers you name from the project (the same inputs `optimize_prompts_and_models`
+takes, below) and runs each eval record once per candidate, against a temporary `<service>_exp`
+clone. Each LLM call must use its role's service, `resolve_model_service("<role>")`, which reads the
+`AGENT_MODEL_SERVICE_<ROLE>` env var that deploy (and the job, before importing your code) sets. With `--prompt`, GEPA rewrites those prompts for each
+candidate model too. `models apply` switches to the best quality / latency / cost trade-off and
+registers any rewritten prompts (prior versions keep `@production_previous`); `models rollback`
+undoes the last model switch.
 
 The search is `databricks_agentkit.model_upgrades`, which you can also call directly (for example
 from a notebook) to tune several model services and MLflow Prompt Registry prompts together:
@@ -509,12 +518,12 @@ agentbricks [-p <profile>] [-o text|json]
                      [--schema CATALOG.SCHEMA]
     remove           TOOL_ID [MCP_SERVICE] [--source PATH]
   models
-    bind       SERVICE [--default MODEL] [--source PATH]
+    bind       SERVICE [--role ROLE] [--default MODEL] [--source PATH]
     unbind | list | status
-    set        MODEL [--yes]
-    rollback   [--yes]
-    upgrade    --candidates MODEL [...] [--traces N] [--budget N] [--weights Q,L,C]
-               [--timeout-hours H] [--wait]
+    set        MODEL [--role ROLE] [--yes]
+    rollback   [--role ROLE] [--yes]
+    upgrade    --candidates [ROLE=]MODEL[,...] [...] [--prompt URI ...] --predict REF --train-data REF --val-data REF
+               --scorer REF [...] [--budget N] [--weights Q,L,C] [--timeout-hours H] [--wait]
     apply      [--yes]
   deploy       [<name>] [--source PATH] [--instances N]
   deployments  list | get | logs | start | stop | delete
